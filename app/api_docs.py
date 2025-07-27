@@ -1,4 +1,4 @@
-# 순환 import 문제로 인해 비활성화됨
+# 순환 import 문제로 인해 비활성화됨.
 # 향후 개선 예정
 
 tags_metadata = [
