@@ -1,0 +1,9 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Good Hands Care Service API",
+    "description": "\n## 재외동포 케어 서비스 API\n\n### 주요 기능\n- **인증**: JWT 토큰 기반 로그인/회원가입\n- **케어기버**: 출근/퇴근, 체크리스트, 돌봄노트, 케어 스케줄\n- **가디언**: AI 리포트 조회, 추이 분석, 피드백 전송  \n- **AI 분석**: 자동 점수 계산, 추이 분석, 특이사항 감지\n\n### 테스트 계정\n- 케어기버: `CG001` / `password123`\n- 가디언: `GD001` / `password123`\n- 관리자: `AD001` / `admin123`\n    ",
+    "version": "1.0.0"
+  },
+  "summary": "서버에서 가져온 OpenAPI 스펙 - 2025-07-26"
+}
