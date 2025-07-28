@@ -10,9 +10,13 @@ class AIReport(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     care_session_id = Column(Integer, ForeignKey("care_sessions.id"), nullable=False)
+    report_type = Column(String(30))  # nutrition_report, hypertension_report, depression_report, care_note_comment - 새 컬럼
+    checklist_type_code = Column(String(20), ForeignKey("checklist_types.type_code"))  # 새 컬럼
     keywords = Column(JSON)  # 키워드 리스트
     content = Column(Text, nullable=False)  # 리포트 본문
     ai_comment = Column(Text)  # AI 코멘트
+    status_code = Column(Integer)  # 1:개선, 2:유지, 3:악화 (코멘트는 NULL) - 새 컬럼
+    trend_analysis = Column(Text)  # 3주차 추이 분석 내용 - 새 컬럼
     status = Column(String(20), default="generated")  # generated, read, reviewed
     
     # 새로 추가된 컬럼들
@@ -27,6 +31,7 @@ class AIReport(Base):
     
     # 관계 설정
     care_session = relationship("CareSession")
+    checklist_type = relationship("ChecklistType")  # 새 관계
 
 class Feedback(Base):
     __tablename__ = "feedbacks"

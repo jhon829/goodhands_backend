@@ -3,8 +3,8 @@ from typing import List
 
 class Settings(BaseSettings):
     # 데이터베이스 설정 (개발환경: SQLite, 운영환경: MariaDB)
-    database_url: str = "sqlite:///./goodhands.db"
-    # database_url: str = "mysql+pymysql://root:password@49.50.131.188:3306/goodhands"
+    database_url: str = "mysql+pymysql://goodhands:goodhands2024@49.50.132.155:3306/goodhands?charset=utf8mb4"
+    # database_url: str = "sqlite:///./goodhands.db"
     
     # JWT 설정
     secret_key: str = "your-secret-key-here-please-change-in-production"

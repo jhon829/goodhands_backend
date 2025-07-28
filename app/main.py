@@ -15,7 +15,7 @@ from app.response_models import success_response, LoginResponse
 from app.logging_config import LoggingMiddleware, setup_logging
 
 # 라우터 임포트
-from app.routers import caregiver, guardian, ai, admin, caregiver_schedule
+from app.routers import caregiver, guardian, ai, admin, caregiver_schedule, ai_v2_compatible
 
 # 로깅 설정
 setup_logging()
@@ -91,6 +91,7 @@ app.include_router(caregiver.router, prefix="/api/caregiver", tags=["caregiver"]
 app.include_router(caregiver_schedule.router, prefix="/api/caregiver", tags=["caregiver"])
 app.include_router(guardian.router, prefix="/api/guardian", tags=["guardian"])
 app.include_router(ai.router, prefix="/api/ai", tags=["ai"])
+app.include_router(ai_v2_compatible.router, prefix="/api/ai/v2", tags=["ai"])  # DB v1.4.0 호환 API
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 
 @app.get("/")

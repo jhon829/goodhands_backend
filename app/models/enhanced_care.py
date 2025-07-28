@@ -25,27 +25,6 @@ class CareSchedule(Base):
     caregiver = relationship("Caregiver")
     senior = relationship("Senior")
 
-# 주간 체크리스트 점수 집계 모델
-class WeeklyChecklistScore(Base):
-    __tablename__ = "weekly_checklist_scores"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    senior_id = Column(Integer, ForeignKey("seniors.id"), nullable=False)
-    caregiver_id = Column(Integer, ForeignKey("caregivers.id"), nullable=False)
-    week_start_date = Column(Date, nullable=False)
-    week_end_date = Column(Date, nullable=False)
-    total_score = Column(Integer, nullable=False)
-    max_possible_score = Column(Integer, nullable=False)
-    score_percentage = Column(DECIMAL(5,2), nullable=False)
-    checklist_count = Column(Integer, nullable=False)
-    score_breakdown = Column(JSON)  # 카테고리별 점수
-    trend_indicator = Column(String(20))  # 'improving', 'stable', 'declining'
-    created_at = Column(DateTime, server_default=func.now())
-    
-    # 관계 설정
-    senior = relationship("Senior")
-    caregiver = relationship("Caregiver")
-
 # 상태 변화 추이 분석 모델
 class HealthTrendAnalysis(Base):
     __tablename__ = "health_trend_analysis"

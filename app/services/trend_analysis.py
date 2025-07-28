@@ -7,7 +7,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 import statistics
 
-from app.models.enhanced_care import WeeklyChecklistScore, HealthTrendAnalysis
+from app.models.care import WeeklyChecklistScore
+from app.models.enhanced_care import HealthTrendAnalysis
 
 class TrendAnalysisService:
     def __init__(self, db: Session):

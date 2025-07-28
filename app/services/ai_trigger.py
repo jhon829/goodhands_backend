@@ -6,7 +6,8 @@ from typing import Dict, Any, List
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from app.models import CareSession, ChecklistResponse, CareNote, AIReport, Senior
-from app.models.enhanced_care import WeeklyChecklistScore, SpecialNote
+from app.models.care import WeeklyChecklistScore
+from app.models.enhanced_care import SpecialNote
 from app.config import settings
 
 class AIAnalysisTrigger:

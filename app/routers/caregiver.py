@@ -8,6 +8,7 @@ from datetime import datetime, date, timedelta
 
 from ..database import get_db
 from ..models import User, Senior, CareSession, ChecklistResponse, CareNote, Notification, NursingHome
+from ..models.care import ChecklistType, WeeklyChecklistScore, CareNoteQuestion
 from ..models.enhanced_care import CareSchedule
 from ..schemas import (
     CareSessionResponse, SeniorResponse, ChecklistSubmission, CareNoteSubmission,
@@ -389,16 +390,19 @@ async def get_checklist_template(
 
 @router.post("/checklist")
 async def submit_checklist(
-    checklist_data: ChecklistSubmission,
+    checklist_data: dict,  # 3가지 유형별 체크리스트 데이터
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """체크리스트 제출"""
+    """3가지 유형별 체크리스트 제출 (n8n v2.0)"""
     try:
+        session_id = checklist_data.get("session_id")
+        responses = checklist_data.get("responses", {})
+        
         # 돌봄 세션 확인
         care_session = db.query(CareSession).filter(
-            CareSession.id == checklist_data.session_id,
-            CareSession.caregiver_id == current_user.id
+            CareSession.id == session_id,
+            CareSession.caregiver_id == current_user.caregiver_profile.id
         ).first()
         
         if not care_session:
@@ -407,23 +411,33 @@ async def submit_checklist(
                 detail="돌봄 세션을 찾을 수 없습니다."
             )
         
-        # 체크리스트 응답 저장
-        for response in checklist_data.responses:
-            checklist_response = ChecklistResponse(
-                session_id=checklist_data.session_id,
-                question_key=response.question_key,
-                question_text=response.question_text,
-                answer=response.answer,
-                notes=response.notes
-            )
-            db.add(checklist_response)
+        # 3가지 유형별로 체크리스트 응답 저장
+        total_responses = 0
+        for type_code in ["nutrition", "hypertension", "depression"]:
+            if type_code in responses:
+                type_responses = responses[type_code]
+                
+                for sub_q_id, response_data in type_responses.items():
+                    checklist_response = ChecklistResponse(
+                        care_session_id=session_id,
+                        checklist_type_code=type_code,
+                        sub_question_id=sub_q_id,
+                        question_key=response_data["question_key"],
+                        question_text=response_data["question_text"],
+                        answer=response_data["answer"],
+                        selected_score=response_data["selected_score"],
+                        notes=response_data.get("notes", "")
+                    )
+                    db.add(checklist_response)
+                    total_responses += 1
         
         db.commit()
         
         return {
-            "message": "체크리스트가 성공적으로 제출되었습니다.",
-            "session_id": checklist_data.session_id,
-            "responses_count": len(checklist_data.responses)
+            "message": "3가지 유형별 체크리스트가 성공적으로 저장되었습니다.",
+            "session_id": session_id,
+            "responses_count": total_responses,
+            "types_completed": len([t for t in ["nutrition", "hypertension", "depression"] if t in responses])
         }
         
     except Exception as e:
@@ -434,16 +448,21 @@ async def submit_checklist(
 
 @router.post("/care-note")
 async def submit_care_note(
-    care_note_data: CareNoteSubmission,
+    care_note_data: dict,  # 1개 랜덤 돌봄노트 데이터
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """돌봄노트 제출"""
+    """1개 랜덤 돌봄노트 제출 (n8n v2.0)"""
     try:
+        session_id = care_note_data.get("session_id")
+        question_id = care_note_data.get("question_id")
+        question_number = care_note_data.get("question_number")
+        content = care_note_data.get("content")
+        
         # 돌봄 세션 확인
         care_session = db.query(CareSession).filter(
-            CareSession.id == care_note_data.session_id,
-            CareSession.caregiver_id == current_user.id
+            CareSession.id == session_id,
+            CareSession.caregiver_id == current_user.caregiver_profile.id
         ).first()
         
         if not care_session:
@@ -452,31 +471,32 @@ async def submit_care_note(
                 detail="돌봄 세션을 찾을 수 없습니다."
             )
         
-        # 돌봄노트 저장
-        for note in care_note_data.notes:
-            care_note = CareNote(
-                session_id=care_note_data.session_id,
-                question_type=note.question_type,
-                question_text=note.question_text,
-                content=note.content
-            )
-            db.add(care_note)
+        # 1개 랜덤 돌봄노트 저장
+        care_note = CareNote(
+            care_session_id=session_id,
+            selected_question_id=question_id,
+            question_number=question_number,
+            content=content
+        )
         
+        db.add(care_note)
         db.commit()
         
-        # === 돌봄노트 제출 완료 후 AI 분석 워크플로우 트리거 ===
-        # 세션 상태를 완료로 업데이트
+        # 체크리스트와 돌봄노트 모두 완료되면 주간 점수 계산
+        await calculate_and_save_weekly_scores(session_id, care_session.senior_id, db)
+        
+        # n8n 워크플로우 트리거
+        await trigger_ai_analysis_workflows_v2(session_id, care_session.senior_id)
+        
+        # 세션 상태 완료로 업데이트
         care_session.status = "completed"
         care_session.end_time = datetime.now()
         db.commit()
         
-        # 새로운 카테고리별 상세 분석 워크플로우 트리거
-        await trigger_enhanced_ai_analysis_workflow(care_note_data.session_id)
-        
         return {
-            "message": "돌봄노트가 성공적으로 제출되었습니다.",
-            "session_id": care_note_data.session_id,
-            "notes_count": len(care_note_data.notes),
+            "message": "돌봄노트가 성공적으로 저장되었습니다.",
+            "session_id": session_id,
+            "question_id": question_id,
             "ai_analysis_triggered": True
         }
         
@@ -486,41 +506,85 @@ async def submit_care_note(
             detail=f"돌봄노트 제출 중 오류가 발생했습니다: {str(e)}"
         )
 
-async def trigger_enhanced_ai_analysis_workflow(session_id: int):
-    """카테고리별 상세 분석이 포함된 AI 워크플로우 트리거"""
-    import requests
-    from datetime import datetime
+async def calculate_and_save_weekly_scores(session_id: int, senior_id: int, db: Session):
+    """주간 체크리스트 점수 계산 및 저장"""
+    from ..models.care import WeeklyChecklistScore, ChecklistType
     
-    webhook_data = {
+    week_date = date.today()
+    
+    # 3가지 유형별 점수 계산
+    type_codes = ["nutrition", "hypertension", "depression"]
+    
+    for type_code in type_codes:
+        # 해당 유형의 체크리스트 응답 조회
+        responses = db.query(ChecklistResponse).filter(
+            ChecklistResponse.care_session_id == session_id,
+            ChecklistResponse.checklist_type_code == type_code
+        ).all()
+        
+        if not responses:
+            continue
+            
+        # 점수 합계 계산
+        total_score = sum([r.selected_score for r in responses if r.selected_score])
+        checklist_type = db.query(ChecklistType).filter(
+            ChecklistType.type_code == type_code
+        ).first()
+        max_score = checklist_type.max_score if checklist_type else 16
+        score_percentage = (total_score / max_score) * 100 if max_score > 0 else 0
+        
+        # 지난 주 점수와 비교하여 상태코드 결정
+        last_week_score = db.query(WeeklyChecklistScore).filter(
+            WeeklyChecklistScore.senior_id == senior_id,
+            WeeklyChecklistScore.checklist_type_code == type_code
+        ).order_by(WeeklyChecklistScore.week_date.desc()).first()
+        
+        status_code = 2  # 기본값: 유지
+        if last_week_score:
+            if total_score > last_week_score.total_score:
+                status_code = 1  # 개선
+            elif total_score < last_week_score.total_score:
+                status_code = 3  # 악화
+        
+        # 주간 점수 저장
+        weekly_score = WeeklyChecklistScore(
+            senior_id=senior_id,
+            care_session_id=session_id,
+            checklist_type_code=type_code,
+            week_date=week_date,
+            total_score=total_score,
+            max_possible_score=max_score,
+            score_percentage=score_percentage,
+            status_code=status_code
+        )
+        db.add(weekly_score)
+    
+    db.commit()
+
+async def trigger_ai_analysis_workflows_v2(session_id: int, senior_id: int):
+    """n8n AI 분석 워크플로우 v2.0 트리거"""
+    import requests
+    
+    webhook_base_url = "http://pay.gzonesoft.co.kr:10006/webhook"
+    
+    trigger_data = {
         "session_id": session_id,
-        "trigger_time": datetime.now().isoformat(),
-        "analysis_type": "enhanced_category_analysis"
+        "senior_id": senior_id,
+        "trigger_time": datetime.now().isoformat()
     }
     
-    # 새로운 카테고리별 상세 분석 워크플로우 호출
+    # 통합 조율 워크플로우 호출
     try:
         response = requests.post(
-            "http://pay.gzonesoft.co.kr:10006/webhook/weekly-ai-comment-enhanced",
-            json=webhook_data,
+            f"{webhook_base_url}/complete-ai-analysis",
+            json=trigger_data,
             timeout=30
         )
-        print(f"Enhanced AI Analysis Workflow triggered: {response.status_code}")
+        print(f"n8n v2.0 워크플로우 트리거 성공: {response.status_code}")
         return {"status": "triggered", "session_id": session_id}
     except Exception as e:
-        print(f"Enhanced AI Analysis Workflow failed: {e}")
-        
-        # 실패 시 기존 워크플로우로 폴백
-        try:
-            fallback_response = requests.post(
-                "http://pay.gzonesoft.co.kr:10006/webhook/weekly-ai-comment",
-                json=webhook_data,
-                timeout=30
-            )
-            print(f"Fallback to basic workflow: {fallback_response.status_code}")
-            return {"status": "fallback", "session_id": session_id}
-        except Exception as fallback_error:
-            print(f"Fallback workflow also failed: {fallback_error}")
-            return {"status": "failed", "session_id": session_id}
+        print(f"n8n v2.0 워크플로우 트리거 실패: {e}")
+        return {"status": "failed", "error": str(e)}
 
 @router.get("/care-history")
 async def get_care_history(
