@@ -1,28 +1,33 @@
 from pydantic_settings import BaseSettings
 from typing import List
+import os
 
 class Settings(BaseSettings):
-    # 데이터베이스 설정 (개발환경: SQLite, 운영환경: MariaDB)
-    database_url: str = "mysql+pymysql://goodhands:goodhands2024@49.50.132.155:3306/goodhands?charset=utf8mb4"
-    # database_url: str = "sqlite:///./goodhands.db"
+    # 데이터베이스 설정 (환경변수에서 읽어오기)
+    database_url: str = os.getenv("DATABASE_URL", "sqlite:///./goodhands.db")
+    database_host: str = os.getenv("DATABASE_HOST", "localhost")
+    database_port: int = int(os.getenv("DATABASE_PORT", "3306"))
+    database_name: str = os.getenv("DATABASE_NAME", "goodhands")
+    database_user: str = os.getenv("DATABASE_USER", "goodhands")
+    database_password: str = os.getenv("DATABASE_PASSWORD", "goodhands2024")
     
-    # JWT 설정
-    secret_key: str = "your-secret-key-here-please-change-in-production"
-    algorithm: str = "HS256"
-    access_token_expire_minutes: int = 10080  # 7일 = 7 * 24 * 60 = 10080분
+    # JWT 설정 (환경변수에서 읽어오기)
+    secret_key: str = os.getenv("SECRET_KEY", "your-secret-key-here-please-change-in-production")
+    algorithm: str = os.getenv("ALGORITHM", "HS256")
+    access_token_expire_minutes: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
     
     # 파일 업로드 설정
-    upload_dir: str = "uploads"
-    max_file_size: int = 10485760  # 10MB
-    base_url: str = "http://localhost:8000"
+    upload_dir: str = os.getenv("UPLOAD_DIR", "uploads")
+    max_file_size: int = int(os.getenv("MAX_FILE_SIZE", "10485760"))  # 10MB
+    base_url: str = os.getenv("BASE_URL", "http://localhost:8000")
     
     # AI 서비스 설정 (n8n 대신 내부 처리)
-    ai_service_url: str = "http://localhost:8001"
+    ai_service_url: str = os.getenv("AI_SERVICE_URL", "http://localhost:8001")
     
     # 환경 설정
-    environment: str = "development"
-    debug: bool = True
-    app_version: str = "1.4.0"
+    environment: str = os.getenv("ENVIRONMENT", "development")
+    debug: bool = os.getenv("DEBUG", "True").lower() == "true"
+    app_version: str = os.getenv("APP_VERSION", "1.4.0")
     
     # CORS 설정
     cors_origins: List[str] = [
