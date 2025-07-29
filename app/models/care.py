@@ -97,19 +97,24 @@ class WeeklyChecklistScore(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     senior_id = Column(Integer, ForeignKey("seniors.id"), nullable=False)
-    care_session_id = Column(Integer, ForeignKey("care_sessions.id"), nullable=False)
-    checklist_type_code = Column(String(20), ForeignKey("checklist_types.type_code"), nullable=False)
-    week_date = Column(Date, nullable=False)
+    caregiver_id = Column(Integer, ForeignKey("caregivers.id"), nullable=False)
+    care_session_id = Column(Integer, ForeignKey("care_sessions.id"))  # 새로 추가된 컬럼
+    checklist_type_code = Column(String(20))  # 새로 추가된 컬럼
+    week_start_date = Column(Date, nullable=False)
+    week_end_date = Column(Date, nullable=False)
+    week_date = Column(Date)  # 새로 추가된 컬럼 (API에서 사용)
     total_score = Column(Integer, nullable=False)
     max_possible_score = Column(Integer, nullable=False)
     score_percentage = Column(DECIMAL(5,2), nullable=False)
-    status_code = Column(Integer)  # 1:개선, 2:유지, 3:악화
+    status_code = Column(Integer)  # 새로 추가된 컬럼 (1:개선, 2:유지, 3:악화)
+    checklist_count = Column(Integer, nullable=False)
+    score_breakdown = Column(JSON)
+    trend_indicator = Column(String(20))
     created_at = Column(DateTime, server_default=func.now())
     
     # 관계 설정
     senior = relationship("Senior")
-    care_session = relationship("CareSession")
-    checklist_type = relationship("ChecklistType")
+    caregiver = relationship("Caregiver")
 
 
 class CareNoteQuestion(Base):

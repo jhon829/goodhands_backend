@@ -10,6 +10,7 @@ class AIReport(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     care_session_id = Column(Integer, ForeignKey("care_sessions.id"), nullable=False)
+    senior_id = Column(Integer, ForeignKey("seniors.id"))  # 새로 추가된 컬럼
     report_type = Column(String(30))  # nutrition_report, hypertension_report, depression_report, care_note_comment - 새 컬럼
     checklist_type_code = Column(String(20), ForeignKey("checklist_types.type_code"))  # 새 컬럼
     keywords = Column(JSON)  # 키워드 리스트
@@ -31,6 +32,7 @@ class AIReport(Base):
     
     # 관계 설정
     care_session = relationship("CareSession")
+    senior = relationship("Senior")  # 새로 추가된 관계
     checklist_type = relationship("ChecklistType")  # 새 관계
 
 class Feedback(Base):

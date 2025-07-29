@@ -471,22 +471,35 @@ async def submit_care_note(
                 detail="돌봄 세션을 찾을 수 없습니다."
             )
         
+        # 질문 정보 조회
+        question_info = db.query(CareNoteQuestion).filter(
+            CareNoteQuestion.id == question_id
+        ).first()
+        
+        if not question_info:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="질문 정보를 찾을 수 없습니다."
+            )
+        
         # 1개 랜덤 돌봄노트 저장
         care_note = CareNote(
             care_session_id=session_id,
             selected_question_id=question_id,
             question_number=question_number,
+            question_type=question_info.question_title,  # 질문 제목을 타입으로 사용
+            question_text=question_info.question_text,   # 질문 텍스트 추가
             content=content
         )
         
         db.add(care_note)
         db.commit()
         
-        # 체크리스트와 돌봄노트 모두 완료되면 주간 점수 계산
-        await calculate_and_save_weekly_scores(session_id, care_session.senior_id, db)
+        # 체크리스트와 돌봄노트 모두 완료되면 주간 점수 계산 (임시 주석처리)
+        # await calculate_and_save_weekly_scores(session_id, care_session.senior_id, db)
         
-        # n8n 워크플로우 트리거
-        await trigger_ai_analysis_workflows_v2(session_id, care_session.senior_id)
+        # n8n 워크플로우 트리거 (임시 주석처리)
+        # await trigger_ai_analysis_workflows_v2(session_id, care_session.senior_id)
         
         # 세션 상태 완료로 업데이트
         care_session.status = "completed"
