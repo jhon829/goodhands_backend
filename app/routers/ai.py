@@ -20,12 +20,254 @@ from ..models import (
     WeeklyChecklistScore, Notification
 )
 from ..schemas import AIReportResponse, AIReportCreate
-from ..services.auth import get_current_user
+from ..services.auth import get_current_user, verify_n8n_api_key
 
 router = APIRouter()
 
 # ============================================================================
-# 1. 체크리스트 추이 데이터 조회 (n8n → GPT 입력 데이터)
+# n8n 전용 API 엔드포인트들 (API Key 인증)
+# ============================================================================
+
+@router.get("/n8n/checklist-trend-data/{senior_id}/{type_code}")
+async def get_checklist_trend_data_n8n(
+    senior_id: int,
+    type_code: str,
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_n8n_api_key)  # n8n 전용 인증
+):
+    """
+    n8n 전용: 특정 유형의 3주차 체크리스트 점수 추이 데이터 조회
+    """
+    try:
+        # 시니어 존재 확인
+        senior = db.query(Senior).filter(Senior.id == senior_id).first()
+        if not senior:
+            raise HTTPException(404, "시니어를 찾을 수 없습니다.")
+        
+        # 체크리스트 유형 확인
+        checklist_type = db.query(ChecklistType).filter(
+            ChecklistType.type_code == type_code
+        ).first()
+        
+        if not checklist_type:
+            raise HTTPException(404, f"체크리스트 유형을 찾을 수 없습니다: {type_code}")
+        
+        # 지난 3주차 점수 조회 (최신순)
+        recent_scores = db.query(WeeklyChecklistScore).filter(
+            WeeklyChecklistScore.senior_id == senior_id,
+            WeeklyChecklistScore.checklist_type_code == type_code
+        ).order_by(WeeklyChecklistScore.week_date.desc()).limit(3).all()
+        
+        # 현재 점수 (가장 최신)
+        current_score = recent_scores[0] if recent_scores else None
+        
+        # 이전 점수들 (두 번째부터)
+        previous_scores = recent_scores[1:] if len(recent_scores) > 1 else []
+        
+        return {
+            "senior_id": senior_id,
+            "senior_name": senior.name,
+            "senior_age": senior.age,
+            "checklist_type": {
+                "type_code": type_code,
+                "type_name": checklist_type.type_name,
+                "max_score": checklist_type.max_score
+            },
+            "current_score": {
+                "total_score": current_score.total_score if current_score else 0,
+                "score_percentage": float(current_score.score_percentage) if current_score else 0,
+                "status_code": current_score.status_code if current_score else 2,
+                "week_date": current_score.week_date.isoformat() if current_score else None
+            } if current_score else None,
+            "previous_scores": [
+                {
+                    "total_score": score.total_score,
+                    "score_percentage": float(score.score_percentage),
+                    "status_code": score.status_code,
+                    "week_date": score.week_date.isoformat()
+                } for score in previous_scores
+            ],
+            "weeks_available": len(recent_scores)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"데이터 조회 중 오류: {str(e)}")
+
+@router.get("/n8n/care-note-data/{session_id}")
+async def get_care_note_data_n8n(
+    session_id: int,
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_n8n_api_key)  # n8n 전용 인증
+):
+    """
+    n8n 전용: 특정 세션의 돌봄노트 데이터 조회
+    """
+    try:
+        # 케어 세션 조회
+        care_session = db.query(CareSession).filter(
+            CareSession.id == session_id
+        ).first()
+        
+        if not care_session:
+            raise HTTPException(404, "케어 세션을 찾을 수 없습니다.")
+        
+        # 돌봄노트 조회
+        care_note = db.query(CareNote).filter(
+            CareNote.care_session_id == session_id
+        ).first()
+        
+        if not care_note:
+            raise HTTPException(404, "돌봄노트를 찾을 수 없습니다.")
+        
+        # 질문 정보 조회
+        question_info = {}
+        if care_note.selected_question_id:
+            question = db.query(CareNoteQuestion).filter(
+                CareNoteQuestion.id == care_note.selected_question_id
+            ).first()
+            if question:
+                question_info = {
+                    "question_title": question.question_title,
+                    "question_text": question.question_text,
+                    "guide_text": question.guide_text
+                }
+        
+        # 시니어 정보 조회
+        senior = db.query(Senior).filter(
+            Senior.id == care_session.senior_id
+        ).first()
+        
+        return {
+            "session_id": session_id,
+            "senior_id": care_session.senior_id,
+            "content": care_note.content,
+            "question_title": question_info.get("question_title", ""),
+            "question_text": question_info.get("question_text", ""),
+            "senior_name": senior.name if senior else "Unknown",
+            "senior_age": senior.age if senior else None,
+            "created_at": care_note.created_at.isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"돌봄노트 데이터 조회 중 오류: {str(e)}")
+
+@router.post("/n8n/save-complete-analysis")
+async def save_complete_analysis_n8n(
+    analysis_data: Dict[str, Any],
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_n8n_api_key)  # n8n 전용 인증
+):
+    """
+    n8n 전용: 완전한 AI 분석 결과 저장 (4개 리포트)
+    """
+    try:
+        session_id = analysis_data.get("session_id")
+        senior_id = analysis_data.get("senior_id")
+        reports = analysis_data.get("reports", [])
+        
+        if not all([session_id, senior_id, reports]):
+            raise HTTPException(400, "session_id, senior_id, reports가 모두 필요합니다.")
+        
+        saved_report_ids = []
+        
+        for report in reports:
+            ai_report = AIReport(
+                care_session_id=session_id,
+                senior_id=senior_id,
+                report_type=report.get("report_type"),
+                checklist_type_code=report.get("checklist_type_code"),
+                content=report.get("content"),
+                ai_comment=report.get("ai_comment"),
+                status_code=report.get("status_code"),
+                trend_analysis=report.get("trend_analysis"),
+                created_at=datetime.now()
+            )
+            
+            db.add(ai_report)
+            db.flush()
+            saved_report_ids.append(ai_report.id)
+        
+        db.commit()
+        
+        return {
+            "status": "success",
+            "message": f"{len(reports)}개의 리포트가 저장되었습니다.",
+            "report_ids": saved_report_ids,
+            "session_id": session_id,
+            "senior_id": senior_id
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"AI 분석 결과 저장 중 오류: {str(e)}")
+
+@router.post("/n8n/send-guardian-notification")
+async def send_guardian_notification_n8n(
+    notification_data: Dict[str, Any],
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_n8n_api_key)  # n8n 전용 인증
+):
+    """
+    n8n 전용: 가디언에게 분석 완료 알림 발송
+    """
+    try:
+        senior_id = notification_data.get("senior_id")
+        session_id = notification_data.get("session_id")
+        summary = notification_data.get("summary", "돌봄 분석이 완료되었습니다.")
+        
+        if not all([senior_id, session_id]):
+            raise HTTPException(400, "senior_id, session_id가 필요합니다.")
+        
+        # 시니어 정보 조회
+        senior = db.query(Senior).filter(Senior.id == senior_id).first()
+        if not senior or not senior.guardian_id:
+            raise HTTPException(404, "시니어 또는 가디언을 찾을 수 없습니다.")
+        
+        # 가디언 정보 조회
+        guardian = db.query(Guardian).filter(Guardian.id == senior.guardian_id).first()
+        if not guardian:
+            raise HTTPException(404, "가디언을 찾을 수 없습니다.")
+        
+        # 알림 생성
+        notification = Notification(
+            sender_id=11,  # 케어기버 user_id (고정값)
+            receiver_id=guardian.user_id,
+            type="complete_ai_analysis",
+            title=f"{senior.name}님 돌봄 분석 완료",
+            content=summary,
+            data=json.dumps({
+                "senior_id": senior_id,
+                "session_id": session_id,
+                "priority": "normal"
+            }),
+            is_read=False
+        )
+        
+        db.add(notification)
+        db.commit()
+        
+        return {
+            "status": "success",
+            "message": "알림이 발송되었습니다.",
+            "notification_id": notification.id,
+            "guardian_name": guardian.name,
+            "sent_at": notification.created_at.isoformat()
+        }
+        
+    except HTTPException:
+        raise  
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"알림 발송 중 오류: {str(e)}")
+
+# ============================================================================
+# 기존 JWT 인증 API 엔드포인트들 (하위 호환성 유지)
 # ============================================================================
 
 @router.get("/checklist-trend-data/{senior_id}/{type_code}")

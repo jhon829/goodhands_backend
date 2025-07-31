@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from fastapi import HTTPException, status, Depends
+from fastapi import HTTPException, status, Depends, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from app.config import settings
@@ -90,3 +90,18 @@ def get_current_admin(current_user: User = Depends(get_current_user)):
             detail="Not an admin"
         )
     return current_user
+
+def verify_n8n_api_key(api_key: str = Header(..., alias="X-API-Key")):
+    """n8n 전용 API 키 검증"""
+    if api_key != settings.n8n_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API Key for n8n"
+        )
+    return True
+
+def verify_n8n_api_key_optional(api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    """n8n API 키 검증 (선택적)"""
+    if api_key and api_key == settings.n8n_api_key:
+        return True
+    return False

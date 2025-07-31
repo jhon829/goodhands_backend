@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     n8n_webhook_url: str = os.getenv("N8N_WEBHOOK_URL", "http://pay.gzonesoft.co.kr:10006")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     
+    # n8n 전용 인증 설정
+    n8n_api_key: str = os.getenv("N8N_API_KEY", "goodhands-n8n-api-key-2025")
+    n8n_allowed_ips: List[str] = ["127.0.0.1", "localhost", "pay.gzonesoft.co.kr"]
+    
     # 체크리스트 & 돌봄노트 설정
     daily_submission_limit: int = int(os.getenv("DAILY_SUBMISSION_LIMIT", "1"))
     checklist_types: List[str] = ["nutrition", "hypertension", "depression"]
