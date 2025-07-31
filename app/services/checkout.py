@@ -11,13 +11,15 @@ class CheckoutService:
     
     @staticmethod
     def validate_required_tasks(db: Session, care_session_id: int) -> tuple[bool, List[str]]:
-        """필수 작업 완료 확인"""
+        """필수 작업 완료 확인 (상세한 로깅 포함)"""
         missing_tasks = []
         
         # 체크리스트 완료 확인
         checklist_count = db.query(ChecklistResponse).filter(
             ChecklistResponse.care_session_id == care_session_id
         ).count()
+        
+        print(f"🔍 체크리스트 검증: session_id={care_session_id}, count={checklist_count}")
         
         if checklist_count == 0:
             missing_tasks.append("체크리스트")
@@ -27,8 +29,12 @@ class CheckoutService:
             CareNote.care_session_id == care_session_id
         ).count()
         
+        print(f"🔍 돌봄노트 검증: session_id={care_session_id}, count={care_note_count}")
+        
         if care_note_count == 0:
             missing_tasks.append("돌봄노트")
+        
+        print(f"🔍 검증 결과: missing_tasks={missing_tasks}, can_checkout={len(missing_tasks) == 0}")
         
         return len(missing_tasks) == 0, missing_tasks
     
