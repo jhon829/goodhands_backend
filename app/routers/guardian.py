@@ -168,13 +168,25 @@ async def get_guardian_home(
         
         unread_notifications_data = []
         for notification in unread_notifications:
+            # notification.data 처리 (문자열이면 JSON 파싱, 딕셔너리면 그대로 사용)
+            notification_data = {}
+            if notification.data:
+                if isinstance(notification.data, str):
+                    try:
+                        import json
+                        notification_data = json.loads(notification.data)
+                    except (json.JSONDecodeError, TypeError):
+                        notification_data = {}
+                elif isinstance(notification.data, dict):
+                    notification_data = notification.data
+            
             unread_notifications_data.append({
                 "id": notification.id,
                 "type": notification.type,
                 "title": notification.title,
                 "content": notification.content,
                 "created_at": notification.created_at.strftime("%Y-%m-%d %H:%M"),
-                "priority": notification.data.get("priority", "normal") if notification.data else "normal"
+                "priority": notification_data.get("priority", "normal")
             })
         
         return {
@@ -243,7 +255,7 @@ async def get_guardian_seniors(
         seniors = db.query(Senior).options(
             joinedload(Senior.caregiver),
             joinedload(Senior.nursing_home),
-            joinedload(Senior.diseases)
+            joinedload(Senior.diseases)  # ✅ 추가: 질병 정보 함께 조회
         ).filter(
             Senior.guardian_id == guardian.id
         ).all()

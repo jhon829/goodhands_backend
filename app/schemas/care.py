@@ -120,3 +120,33 @@ class CareNoteResponse(BaseModel):
 class CareHistoryResponse(BaseModel):
     care_sessions: List[CareSessionResponse]
     total_count: int
+
+# ✅ 추가: 질병별 체크리스트 제출을 위한 새로운 스키마
+class DiseaseChecklistResponseItem(BaseModel):
+    question_id: int
+    scale_value: int  # 1-4 척도 값
+    weight: Optional[float] = 1.0
+    notes: Optional[str] = None
+
+class DiseaseChecklistData(BaseModel):
+    total_score: int  # 프론트에서 계산한 합계
+    responses: List[DiseaseChecklistResponseItem]
+
+class DiseaseChecklistSubmission(BaseModel):
+    session_id: int
+    senior_id: int
+    disease_responses: Dict[str, DiseaseChecklistData]
+    # 예시: {"nutrition": {...}, "hypertension": {...}}
+    
+    @validator('disease_responses')
+    def validate_disease_responses(cls, v):
+        if not v:
+            raise ValueError('적어도 하나의 질병별 응답이 필요합니다.')
+        
+        # 유효한 질병 타입 확인
+        valid_disease_types = ['nutrition', 'hypertension', 'depression', 'diabetes', 'dementia']
+        for disease_type in v.keys():
+            if disease_type not in valid_disease_types:
+                raise ValueError(f'유효하지 않은 질병 타입: {disease_type}')
+        
+        return v

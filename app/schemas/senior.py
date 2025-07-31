@@ -30,6 +30,18 @@ class SeniorCreate(SeniorBase):
 class SeniorUpdate(SeniorBase):
     name: Optional[str] = None
 
+# ✅ 질병 정보 스키마
+class SeniorDiseaseResponse(BaseModel):
+    id: int
+    disease_type: str
+    severity: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+# ✅ 수정: 기본 시니어 응답에 질병 정보 포함
 class SeniorResponse(SeniorBase):
     id: int
     photo: Optional[str] = None
@@ -37,6 +49,9 @@ class SeniorResponse(SeniorBase):
     caregiver_id: Optional[int] = None
     guardian_id: Optional[int] = None
     created_at: datetime
+    
+    # ✅ 추가: 질병 정보 포함
+    diseases: List[SeniorDiseaseResponse] = []
     
     class Config:
         from_attributes = True
@@ -48,9 +63,19 @@ class SeniorDiseaseBase(BaseModel):
     
     @validator('disease_type')
     def validate_disease_type(cls, v):
+        # ✅ 수정: n8n API와 완전히 일치하는 타입 코드 사용
         allowed_diseases = [
-            '치매', '당뇨', '고혈압', '관절염', '심장질환', 
-            '뇌졸중', '파킨슨병', '골다공증', '천식', '기타'
+            'nutrition',      # n8n: nutrition ✅
+            'hypertension',   # n8n: hypertension ✅
+            'depression',     # n8n: depression ✅
+            'diabetes',       # n8n: diabetes ✅
+            'dementia',       # 추가 질병들
+            'arthritis',      
+            'heart_disease',  
+            'stroke',         
+            'parkinsons',     
+            'osteoporosis',   
+            'other'           
         ]
         if v not in allowed_diseases:
             raise ValueError(f'질병 유형은 {", ".join(allowed_diseases)} 중 하나여야 합니다.')
@@ -74,7 +99,16 @@ class SeniorDiseaseResponse(SeniorDiseaseBase):
         from_attributes = True
 
 class SeniorDetailResponse(SeniorResponse):
-    diseases: List[SeniorDiseaseResponse] = []
     nursing_home: Optional[dict] = None
     caregiver: Optional[dict] = None
     guardian: Optional[dict] = None
+
+# ✅ 추가: 프론트엔드에서 사용할 체크리스트 타입 정보
+class AvailableChecklistType(BaseModel):
+    type_code: str
+    type_name: str
+    description: Optional[str] = None
+
+class SeniorWithChecklistTypes(SeniorResponse):
+    """체크리스트 타입 정보가 포함된 시니어 응답"""
+    available_checklist_types: List[AvailableChecklistType] = []

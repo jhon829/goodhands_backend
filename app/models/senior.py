@@ -22,6 +22,9 @@ class Senior(Base):
     caregiver = relationship("Caregiver")
     guardian = relationship("Guardian")
     nursing_home = relationship("NursingHome")
+    
+    # ✅ 추가: diseases 관계
+    diseases = relationship("SeniorDisease", back_populates="senior")
 
 class SeniorDisease(Base):
     __tablename__ = "senior_diseases"
@@ -35,7 +38,7 @@ class SeniorDisease(Base):
     created_at = Column(DateTime, server_default=func.now())
     
     # 관계 설정
-    senior = relationship("Senior")
+    senior = relationship("Senior", back_populates="diseases")
 
 class NursingHome(Base):
     __tablename__ = "nursing_homes"

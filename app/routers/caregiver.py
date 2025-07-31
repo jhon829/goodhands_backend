@@ -14,7 +14,9 @@ from ..schemas import (
     CareSessionResponse, SeniorResponse, ChecklistSubmission, CareNoteSubmission,
     CaregiverHomeResponse, AttendanceCheckIn, AttendanceCheckOut
 )
+from ..schemas.care import DiseaseChecklistSubmission
 from ..schemas.home import CareScheduleResponse, CareScheduleGroup
+from ..schemas.senior import SeniorWithChecklistTypes, AvailableChecklistType
 from ..services.auth import get_current_user
 from ..services.care import CareService
 
@@ -203,12 +205,12 @@ async def get_caregiver_care_schedules(caregiver_id: int, db: Session) -> CareSc
         next_week_schedules=next_week_schedules
     )
 
-@router.get("/seniors", response_model=List[SeniorResponse])
+@router.get("/seniors", response_model=List[SeniorWithChecklistTypes])
 async def get_assigned_seniors(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """담당 시니어 목록 조회"""
+    """담당 시니어 목록 조회 (질병 정보 및 체크리스트 타입 포함)"""
     try:
         # 케어기버 프로필 확인
         if not current_user.caregiver_profile:
@@ -219,11 +221,75 @@ async def get_assigned_seniors(
         
         caregiver = current_user.caregiver_profile
         
+        # ✅ 수정: diseases 관계를 함께 로드
         seniors = db.query(Senior).filter(
             Senior.caregiver_id == caregiver.id
+        ).options(
+            joinedload(Senior.diseases),  # 질병 정보 함께 조회
+            joinedload(Senior.nursing_home),
+            joinedload(Senior.caregiver),
+            joinedload(Senior.guardian)
         ).all()
         
-        return seniors
+        # ✅ 추가: 각 시니어의 질병에 따른 체크리스트 타입 정보 생성
+        result = []
+        for senior in seniors:
+            # 기본 시니어 정보 생성
+            senior_dict = {
+                "id": senior.id,
+                "name": senior.name,
+                "age": senior.age,
+                "gender": senior.gender,
+                "photo": senior.photo,
+                "nursing_home_id": senior.nursing_home_id,
+                "caregiver_id": senior.caregiver_id,
+                "guardian_id": senior.guardian_id,
+                "created_at": senior.created_at,
+                "diseases": [
+                    {
+                        "id": disease.id,
+                        "disease_type": disease.disease_type,
+                        "severity": disease.severity,
+                        "notes": disease.notes,
+                        "created_at": disease.created_at
+                    } for disease in senior.diseases
+                ]
+            }
+            
+            # 해당 시니어의 질병에 따른 사용 가능한 체크리스트 타입 조회
+            available_types = []
+            
+            # 모든 시니어에게 공통 체크리스트 추가
+            available_types.append({
+                "type_code": "nutrition",  # ✅ 수정: nutrition_common → nutrition
+                "type_name": "식사/영양 상태",
+                "description": "모든 시니어 공통 체크리스트"
+            })
+            
+            # 질병별 체크리스트 타입 추가
+            for disease in senior.diseases:
+                disease_type = disease.disease_type
+                
+                # 간단한 매핑으로 카테고리 이름 결정
+                category_names = {
+                    "nutrition": "식사/영양 상태",
+                    "hypertension": "고혈압 관리", 
+                    "depression": "우울증/정신건강",
+                    "diabetes": "당뇨 관리"
+                }
+                
+                category_name = category_names.get(disease_type, disease_type)
+                
+                available_types.append({
+                    "type_code": disease_type,
+                    "type_name": category_name,
+                    "description": f"{disease.severity or ''} 수준의 {category_name} 관리".strip()
+                })
+            
+            senior_dict["available_checklist_types"] = available_types
+            result.append(senior_dict)
+        
+        return result
         
     except Exception as e:
         raise HTTPException(
@@ -390,14 +456,20 @@ async def get_checklist_template(
 
 @router.post("/checklist")
 async def submit_checklist(
-    checklist_data: dict,  # 3가지 유형별 체크리스트 데이터
+    checklist_data: dict,  # 질병별 체크리스트 데이터 (수정됨)
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """3가지 유형별 체크리스트 제출 (n8n v2.0)"""
+    """질병별 체크리스트 제출 - 프론트에서 계산된 점수 포함"""
     try:
         session_id = checklist_data.get("session_id")
-        responses = checklist_data.get("responses", {})
+        senior_id = checklist_data.get("senior_id")
+        
+        # ✅ 새로운 구조: disease_responses 지원
+        disease_responses = checklist_data.get("disease_responses", {})
+        
+        # 기존 구조도 호환: responses 지원
+        legacy_responses = checklist_data.get("responses", {})
         
         # 돌봄 세션 확인
         care_session = db.query(CareSession).filter(
@@ -411,34 +483,93 @@ async def submit_checklist(
                 detail="돌봄 세션을 찾을 수 없습니다."
             )
         
-        # 3가지 유형별로 체크리스트 응답 저장
+        # 시니어 ID 확인 (새로운 요구사항)
+        if senior_id and care_session.senior_id != senior_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="세션의 시니어 ID와 요청된 시니어 ID가 일치하지 않습니다."
+            )
+        
         total_responses = 0
-        for type_code in ["nutrition", "hypertension", "depression"]:
-            if type_code in responses:
-                type_responses = responses[type_code]
+        disease_summary = {}
+        
+        # ✅ 새로운 구조 처리: disease_responses
+        if disease_responses:
+            for disease_type, disease_data in disease_responses.items():
+                disease_responses_saved = 0
                 
-                for sub_q_id, response_data in type_responses.items():
+                # 프론트에서 계산한 total_score 받기
+                total_score = disease_data.get("total_score", 0)
+                responses_list = disease_data.get("responses", [])
+                
+                for response_item in responses_list:
                     checklist_response = ChecklistResponse(
                         care_session_id=session_id,
-                        checklist_type_code=type_code,
-                        sub_question_id=sub_q_id,
-                        question_key=response_data["question_key"],
-                        question_text=response_data["question_text"],
-                        answer=response_data["answer"],
-                        selected_score=response_data["selected_score"],
-                        notes=response_data.get("notes", "")
+                        checklist_type_code=disease_type,
+                        question_id=response_item.get("question_id"),
+                        scale_value=response_item.get("scale_value"),
+                        notes=response_item.get("notes", ""),
+                        weighted_score=response_item.get("scale_value", 0) * response_item.get("weight", 1.0),
+                        category_code=disease_type,
+                        # 기존 필드 호환성
+                        question_key=f"{disease_type}_question_{response_item.get('question_id')}",
+                        answer=response_item.get("scale_value")
                     )
                     db.add(checklist_response)
+                    disease_responses_saved += 1
                     total_responses += 1
+                
+                disease_summary[disease_type] = {
+                    "total_score": total_score,
+                    "responses_count": disease_responses_saved,
+                    "average_score": total_score / len(responses_list) if responses_list else 0
+                }
+        
+        # ✅ 기존 구조 호환: responses
+        elif legacy_responses:
+            for type_code in ["nutrition", "hypertension", "depression"]:
+                if type_code in legacy_responses:
+                    type_responses = legacy_responses[type_code]
+                    
+                    for sub_q_id, response_data in type_responses.items():
+                        checklist_response = ChecklistResponse(
+                            care_session_id=session_id,
+                            checklist_type_code=type_code,
+                            sub_question_id=sub_q_id,
+                            question_key=response_data["question_key"],
+                            question_text=response_data["question_text"],
+                            answer=response_data["answer"],
+                            selected_score=response_data["selected_score"],
+                            notes=response_data.get("notes", "")
+                        )
+                        db.add(checklist_response)
+                        total_responses += 1
         
         db.commit()
         
-        return {
-            "message": "3가지 유형별 체크리스트가 성공적으로 저장되었습니다.",
+        # ✅ 응답 구조 개선
+        response_data = {
+            "status": "success",
+            "message": "체크리스트가 성공적으로 저장되었습니다.",
             "session_id": session_id,
-            "responses_count": total_responses,
-            "types_completed": len([t for t in ["nutrition", "hypertension", "depression"] if t in responses])
+            "total_responses": total_responses
         }
+        
+        # 새로운 구조 사용 시 추가 정보 제공
+        if disease_responses:
+            response_data.update({
+                "senior_id": senior_id,
+                "diseases_processed": list(disease_responses.keys()),
+                "disease_summary": disease_summary,
+                "processing_time": datetime.now().isoformat()
+            })
+        else:
+            # 기존 구조 호환
+            response_data.update({
+                "types_completed": len([t for t in ["nutrition", "hypertension", "depression"] if t in legacy_responses])
+            })
+        
+        return response_data
         
     except Exception as e:
         raise HTTPException(
@@ -599,36 +730,8 @@ async def trigger_ai_analysis_workflows_v2(session_id: int, senior_id: int):
         print(f"n8n v2.0 워크플로우 트리거 실패: {e}")
         return {"status": "failed", "error": str(e)}
 
-@router.get("/care-history")
-async def get_care_history(
-    start_date: Optional[date] = None,
-    end_date: Optional[date] = None,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """돌봄 이력 조회"""
-    try:
-        query = db.query(CareSession).filter(
-            CareSession.caregiver_id == current_user.id
-        )
-        
-        if start_date:
-            query = query.filter(CareSession.start_time >= start_date)
-        if end_date:
-            query = query.filter(CareSession.start_time <= end_date)
-        
-        care_sessions = query.order_by(CareSession.start_time.desc()).all()
-        
-        return {
-            "care_sessions": care_sessions,
-            "total_count": len(care_sessions)
-        }
-        
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"돌봄 이력 조회 중 오류가 발생했습니다: {str(e)}"
-        )
+# ❌ 해커톤에서 제거: /care-history - 홈 화면의 최근 이력으로 대체
+# GET /care-history API 제거됨 (홈 화면에서 최근 돌봄 이력 확인 가능)
 
 @router.get("/profile")
 async def get_caregiver_profile(
@@ -653,109 +756,8 @@ async def get_caregiver_profile(
             detail=f"프로필 조회 중 오류가 발생했습니다: {str(e)}"
         )
 
-# 날짜별 돌봄 일정 조회 API 추가
-@router.get("/schedule")
-async def get_care_schedule_by_date(
-    start_date: Optional[date] = None,
-    end_date: Optional[date] = None,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """날짜별 돌봄 일정 조회"""
-    try:
-        # 케어기버 프로필 확인
-        if not current_user.caregiver_profile:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="케어기버 정보를 찾을 수 없습니다."
-            )
-        
-        caregiver = current_user.caregiver_profile
-        
-        # 기본값 설정 (지정하지 않으면 이번 달)
-        if not start_date:
-            today = date.today()
-            start_date = today.replace(day=1)  # 이번 달 1일
-        
-        if not end_date:
-            # 다음 달 1일 - 1일 = 이번 달 마지막 날
-            if start_date.month == 12:
-                next_month = start_date.replace(year=start_date.year + 1, month=1)
-            else:
-                next_month = start_date.replace(month=start_date.month + 1)
-            end_date = next_month - timedelta(days=1)
-        
-        # 돌봄 일정 조회
-        from sqlalchemy import text
-        
-        query = text("""
-            SELECT 
-                cc.id,
-                cc.senior_id,
-                s.name as senior_name,
-                s.photo as senior_photo,
-                cc.care_date,
-                cc.start_time,
-                cc.end_time,
-                cc.status,
-                cc.notes,
-                nh.name as nursing_home_name,
-                nh.address as nursing_home_address,
-                cs.id as session_id,
-                cs.status as session_status
-            FROM care_calendar cc
-            JOIN seniors s ON cc.senior_id = s.id
-            LEFT JOIN nursing_homes nh ON s.nursing_home_id = nh.id
-            LEFT JOIN care_sessions cs ON (cs.care_calendar_id = cc.id)
-            WHERE cc.caregiver_id = :caregiver_id
-            AND cc.care_date BETWEEN :start_date AND :end_date
-            ORDER BY cc.care_date ASC, cc.start_time ASC
-        """)
-        
-        result = db.execute(query, {
-            "caregiver_id": caregiver.id,
-            "start_date": start_date,
-            "end_date": end_date
-        })
-        
-        schedule_rows = result.fetchall()
-        
-        schedules = []
-        for row in schedule_rows:
-            schedule = {
-                "id": row.id,
-                "senior_id": row.senior_id,
-                "senior_name": row.senior_name,
-                "senior_photo": row.senior_photo,
-                "care_date": row.care_date.isoformat(),
-                "start_time": row.start_time.strftime("%H:%M"),
-                "end_time": row.end_time.strftime("%H:%M"),
-                "status": row.status,
-                "nursing_home_name": row.nursing_home_name,
-                "nursing_home_address": row.nursing_home_address,
-                "notes": row.notes,
-                "session_id": row.session_id,
-                "session_status": row.session_status,
-                "is_today": row.care_date == date.today()
-            }
-            schedules.append(schedule)
-        
-        return {
-            "caregiver_id": caregiver.id,
-            "caregiver_name": caregiver.name,
-            "period": {
-                "start_date": start_date.isoformat(),
-                "end_date": end_date.isoformat()
-            },
-            "schedules": schedules,
-            "total_count": len(schedules)
-        }
-        
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"돌봄 일정 조회 중 오류가 발생했습니다: {str(e)}"
-        )
+# ❌ 해커톤에서 제거: /schedule - 홈 화면의 오늘 일정으로 대체
+# GET /schedule API 제거됨 (홈 화면에서 오늘/이번 주 일정 확인 가능)
 
 @router.get("/care-schedule/{senior_id}")
 async def get_care_schedule(
@@ -799,52 +801,8 @@ async def get_care_schedule(
         "total_schedules": len(schedule_data)
     }
 
-def calculate_next_care_date(day_of_week: int) -> date:
-    """다음 케어 날짜 계산"""
-    today = date.today()
-    days_ahead = day_of_week - today.weekday()
-    
-    if days_ahead <= 0:  # 오늘이거나 지나간 요일
-        days_ahead += 7
-    
-    return today + timedelta(days=days_ahead)
+# ❌ 해커톤에서 제거: care-schedule 관련 함수들
+# 일정 관리 기능은 관리자가 사전에 설정하는 것으로 대체
 
-@router.post("/care-schedule")
-async def create_care_schedule(
-    schedule_data: dict,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """새로운 케어 스케줄 생성"""
-    
-    if not current_user.caregiver_profile:
-        raise HTTPException(status_code=403, detail="케어기버 권한이 필요합니다")
-    
-    # 중복 스케줄 확인
-    existing = db.query(CareSchedule).filter(
-        CareSchedule.senior_id == schedule_data["senior_id"],
-        CareSchedule.caregiver_id == current_user.caregiver_profile.id,
-        CareSchedule.day_of_week == schedule_data["day_of_week"],
-        CareSchedule.is_active == True
-    ).first()
-    
-    if existing:
-        raise HTTPException(status_code=400, detail="해당 요일에 이미 스케줄이 있습니다")
-    
-    new_schedule = CareSchedule(
-        caregiver_id=current_user.caregiver_profile.id,
-        senior_id=schedule_data["senior_id"],
-        day_of_week=schedule_data["day_of_week"],
-        start_time=datetime.strptime(schedule_data["start_time"], "%H:%M").time(),
-        end_time=datetime.strptime(schedule_data["end_time"], "%H:%M").time(),
-        notes=schedule_data.get("notes", "")
-    )
-    
-    db.add(new_schedule)
-    db.commit()
-    db.refresh(new_schedule)
-    
-    return {
-        "message": "케어 스케줄이 생성되었습니다",
-        "schedule_id": new_schedule.id
-    }
+# calculate_next_care_date 함수 제거됨 (불필요)
+# POST /care-schedule API 제거됨 (관리자가 사전 설정)
