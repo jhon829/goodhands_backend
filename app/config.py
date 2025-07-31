@@ -21,8 +21,19 @@ class Settings(BaseSettings):
     max_file_size: int = int(os.getenv("MAX_FILE_SIZE", "10485760"))  # 10MB
     base_url: str = os.getenv("BASE_URL", "http://localhost:8000")
     
-    # AI 서비스 설정 (n8n 대신 내부 처리)
+    # AI 서비스 설정 (n8n 연동)
     ai_service_url: str = os.getenv("AI_SERVICE_URL", "http://localhost:8001")
+    n8n_webhook_url: str = os.getenv("N8N_WEBHOOK_URL", "http://pay.gzonesoft.co.kr:10006")
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    
+    # 체크리스트 & 돌봄노트 설정
+    daily_submission_limit: int = int(os.getenv("DAILY_SUBMISSION_LIMIT", "1"))
+    checklist_types: List[str] = ["nutrition", "hypertension", "depression"]
+    care_note_questions_count: int = int(os.getenv("CARE_NOTE_QUESTIONS_COUNT", "6"))
+    max_checklist_score: int = int(os.getenv("MAX_CHECKLIST_SCORE", "4"))
+    min_checklist_score: int = int(os.getenv("MIN_CHECKLIST_SCORE", "1"))
+    care_note_min_length: int = int(os.getenv("CARE_NOTE_MIN_LENGTH", "20"))
+    care_note_max_length: int = int(os.getenv("CARE_NOTE_MAX_LENGTH", "500"))
     
     # 환경 설정
     environment: str = os.getenv("ENVIRONMENT", "development")

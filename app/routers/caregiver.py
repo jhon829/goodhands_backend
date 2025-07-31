@@ -1,24 +1,36 @@
 """
-케어기버 관련 라우터
+케어기버 관련 라우터 - 체크리스트 & 돌봄노트 통합 버전
 """
 from fastapi import APIRouter, Depends, HTTPException, status, Form
 from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
 from datetime import datetime, date, timedelta
+import time
 
 from ..database import get_db
-from ..models import User, Senior, CareSession, ChecklistResponse, CareNote, Notification, NursingHome
-from ..models.care import ChecklistType, WeeklyChecklistScore, CareNoteQuestion
+from ..models import User, Senior, CareSession, ChecklistResponse, CareNote, Notification, NursingHome, ChecklistType
+from ..models.care import WeeklyChecklistScore, CareNoteQuestion, AttendanceLog
 from ..models.enhanced_care import CareSchedule
 from ..schemas import (
     CareSessionResponse, SeniorResponse, ChecklistSubmission, CareNoteSubmission,
     CaregiverHomeResponse, AttendanceCheckIn, AttendanceCheckOut
 )
-from ..schemas.care import DiseaseChecklistSubmission
+from ..schemas.care import (
+    ChecklistRequest, ChecklistSuccessResponse, ChecklistStatusResponse,
+    CareNoteRequest, CareNoteSuccessResponse, RandomQuestionResponse,
+    TaskStatusResponse, AttendanceCheckoutRequest, CheckoutSuccessResponse
+)
 from ..schemas.home import CareScheduleResponse, CareScheduleGroup
 from ..schemas.senior import SeniorWithChecklistTypes, AvailableChecklistType
 from ..services.auth import get_current_user
-from ..services.care import CareService
+from ..services.checkout import CheckoutService
+from ..services.checklist import ChecklistService
+from ..services.care_note import CareNoteService
+from ..exceptions import (
+    DailyLimitExceeded, SessionNotActive, SessionNotFound, 
+    ModificationBlocked, RequiredTasksIncomplete, InvalidScoreFormat,
+    ContentLengthError, QuestionNotFound
+)
 
 router = APIRouter()
 
@@ -300,8 +312,8 @@ async def get_assigned_seniors(
 @router.post("/attendance/checkin")
 async def check_in_attendance(
     senior_id: int = Form(...),
-    location: str = Form(...),
-    attendance_status: str = Form(...),
+    location: str = Form(default="요양원"),
+    attendance_status: str = Form(default="정상출근"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -363,64 +375,125 @@ async def check_in_attendance(
             detail=f"출근 체크 중 오류가 발생했습니다: {str(e)}"
         )
 
-@router.post("/attendance/checkout")
+@router.post("/attendance/checkout", response_model=CheckoutSuccessResponse)
 async def check_out_attendance(
-    session_id: int = Form(...),
-    location: str = Form(...),
-    attendance_status: str = Form(...),
+    checkout_data: AttendanceCheckoutRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """퇴근 체크아웃"""
+    """퇴근 체크 (필수 작업 완료 확인 + n8n 트리거)"""
     try:
-        # 돌봄 세션 조회
-        care_session = db.query(CareSession).filter(
-            CareSession.id == session_id,
-            CareSession.caregiver_id == current_user.caregiver_profile.id
-        ).first()
-        
-        if not care_session:
+        # 케어기버 프로필 확인
+        if not current_user.caregiver_profile:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="돌봄 세션을 찾을 수 없습니다."
+                detail="케어기버 정보를 찾을 수 없습니다."
             )
         
-        if care_session.status != "active":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="이미 종료된 세션입니다."
-            )
+        # 활성 세션 조회
+        session = db.query(CareSession).filter(
+            CareSession.caregiver_id == current_user.caregiver_profile.id,
+            CareSession.status == 'active'
+        ).first()
         
-        # 돌봄 세션 종료
-        care_session.end_time = datetime.utcnow()
-        care_session.end_location = location
-        care_session.status = "completed"
+        if not session:
+            raise SessionNotFound()
         
-        # 출석 로그 생성
-        from ..models.care import AttendanceLog
+        # 필수 작업 완료 확인
+        can_checkout, missing_tasks = CheckoutService.validate_required_tasks(
+            db, session.id
+        )
         
+        if not can_checkout:
+            raise RequiredTasksIncomplete(missing_tasks)
+        
+        # 퇴근 처리
+        checkout_time = datetime.now()
+        session.status = 'completed'
+        session.end_time = checkout_time
+        session.end_location = checkout_data.location
+        
+        # 출석 로그 저장
         attendance_log = AttendanceLog(
-            care_session_id=care_session.id,
-            type="checkout",
-            location=location,
-            attendance_status=attendance_status
+            care_session_id=session.id,
+            type='checkout',
+            location=checkout_data.location,
+            attendance_status='정상퇴근'
         )
         
         db.add(attendance_log)
         db.commit()
         
-        return {
-            "message": "퇴근 체크가 완료되었습니다.",
-            "session_id": care_session.id,
-            "end_time": care_session.end_time,
-            "duration": str(care_session.end_time - care_session.start_time),
-            "attendance_status": attendance_status
-        }
+        # n8n 워크플로우 트리거
+        ai_triggered = await CheckoutService.trigger_n8n_workflow(
+            session.id, session.senior_id
+        )
         
+        n8n_response = None
+        if ai_triggered:
+            n8n_response = {
+                "status": "triggered",
+                "workflow": "complete-ai-analysis",
+                "session_id": session.id
+            }
+        
+        return CheckoutSuccessResponse(
+            message="퇴근이 완료되었습니다",
+            session_id=session.id,
+            checkout_time=checkout_time,
+            ai_analysis_triggered=ai_triggered,
+            n8n_response=n8n_response
+        )
+        
+    except (SessionNotFound, RequiredTasksIncomplete) as e:
+        raise e
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"퇴근 체크 중 오류가 발생했습니다: {str(e)}"
+        )
+
+@router.get("/task-status/{session_id}", response_model=TaskStatusResponse)
+async def get_task_status(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """작업 완료 상태 조회"""
+    try:
+        can_checkout, missing_tasks = CheckoutService.validate_required_tasks(db, session_id)
+        
+        checklist_completed = ChecklistService.get_completion_status(db, session_id)
+        care_note_completed = CareNoteService.get_completion_status(db, session_id)
+        
+        # 완료 시간 정보
+        completion_summary = {}
+        
+        if checklist_completed:
+            last_checklist = db.query(ChecklistResponse).filter(
+                ChecklistResponse.care_session_id == session_id
+            ).order_by(ChecklistResponse.created_at.desc()).first()
+            if last_checklist:
+                completion_summary["checklist"] = last_checklist.created_at.isoformat()
+        
+        if care_note_completed:
+            care_note = CareNoteService.get_care_note_by_session(db, session_id)
+            if care_note:
+                completion_summary["care_note"] = care_note.created_at.isoformat()
+        
+        return TaskStatusResponse(
+            session_id=session_id,
+            checklist_completed=checklist_completed,
+            care_note_completed=care_note_completed,
+            can_checkout=can_checkout,
+            missing_tasks=missing_tasks,
+            completion_summary=completion_summary
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"작업 상태 조회 중 오류가 발생했습니다: {str(e)}"
         )
 
 @router.get("/checklist/{senior_id}")
@@ -454,201 +527,189 @@ async def get_checklist_template(
             detail=f"체크리스트 템플릿 조회 중 오류가 발생했습니다: {str(e)}"
         )
 
-@router.post("/checklist")
+@router.post("/checklist", response_model=ChecklistSuccessResponse)
 async def submit_checklist(
-    checklist_data: dict,  # 질병별 체크리스트 데이터 (수정됨)
+    checklist_data: ChecklistRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """질병별 체크리스트 제출 - 프론트에서 계산된 점수 포함"""
+    """체크리스트 제출 (점수 배열 방식)"""
+    start_time = time.time()
+    
     try:
-        session_id = checklist_data.get("session_id")
-        senior_id = checklist_data.get("senior_id")
-        
-        # ✅ 새로운 구조: disease_responses 지원
-        disease_responses = checklist_data.get("disease_responses", {})
-        
-        # 기존 구조도 호환: responses 지원
-        legacy_responses = checklist_data.get("responses", {})
-        
-        # 돌봄 세션 확인
-        care_session = db.query(CareSession).filter(
-            CareSession.id == session_id,
-            CareSession.caregiver_id == current_user.caregiver_profile.id
-        ).first()
-        
-        if not care_session:
+        # 케어기버 프로필 확인
+        if not current_user.caregiver_profile:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="돌봄 세션을 찾을 수 없습니다."
+                detail="케어기버 정보를 찾을 수 없습니다."
             )
         
-        # 시니어 ID 확인 (새로운 요구사항)
-        if senior_id and care_session.senior_id != senior_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="세션의 시니어 ID와 요청된 시니어 ID가 일치하지 않습니다."
-            )
+        # 활성 세션 검증
+        if not ChecklistService.validate_active_session(db, checklist_data.session_id):
+            raise SessionNotActive()
         
-        total_responses = 0
-        disease_summary = {}
+        # 하루 1회 제약 검증
+        if not ChecklistService.validate_daily_submission(db, checklist_data.session_id):
+            raise DailyLimitExceeded("체크리스트")
         
-        # ✅ 새로운 구조 처리: disease_responses
-        if disease_responses:
-            for disease_type, disease_data in disease_responses.items():
-                disease_responses_saved = 0
-                
-                # 프론트에서 계산한 total_score 받기
-                total_score = disease_data.get("total_score", 0)
-                responses_list = disease_data.get("responses", [])
-                
-                for response_item in responses_list:
-                    checklist_response = ChecklistResponse(
-                        care_session_id=session_id,
-                        checklist_type_code=disease_type,
-                        question_id=response_item.get("question_id"),
-                        scale_value=response_item.get("scale_value"),
-                        notes=response_item.get("notes", ""),
-                        weighted_score=response_item.get("scale_value", 0) * response_item.get("weight", 1.0),
-                        category_code=disease_type,
-                        # 기존 필드 호환성
-                        question_key=f"{disease_type}_question_{response_item.get('question_id')}",
-                        answer=response_item.get("scale_value")
-                    )
-                    db.add(checklist_response)
-                    disease_responses_saved += 1
-                    total_responses += 1
-                
-                disease_summary[disease_type] = {
-                    "total_score": total_score,
-                    "responses_count": disease_responses_saved,
-                    "average_score": total_score / len(responses_list) if responses_list else 0
-                }
+        # 점수 처리 및 저장
+        results = ChecklistService.process_checklist_scores(
+            db, 
+            checklist_data.session_id, 
+            checklist_data.checklist_scores
+        )
         
-        # ✅ 기존 구조 호환: responses
-        elif legacy_responses:
-            for type_code in ["nutrition", "hypertension", "depression"]:
-                if type_code in legacy_responses:
-                    type_responses = legacy_responses[type_code]
-                    
-                    for sub_q_id, response_data in type_responses.items():
-                        checklist_response = ChecklistResponse(
-                            care_session_id=session_id,
-                            checklist_type_code=type_code,
-                            sub_question_id=sub_q_id,
-                            question_key=response_data["question_key"],
-                            question_text=response_data["question_text"],
-                            answer=response_data["answer"],
-                            selected_score=response_data["selected_score"],
-                            notes=response_data.get("notes", "")
-                        )
-                        db.add(checklist_response)
-                        total_responses += 1
+        processing_time = f"{(time.time() - start_time):.2f}s"
         
-        db.commit()
+        return ChecklistSuccessResponse(
+            message="체크리스트가 성공적으로 저장되었습니다",
+            session_id=checklist_data.session_id,
+            results=results,
+            processing_time=processing_time
+        )
         
-        # ✅ 응답 구조 개선
-        response_data = {
-            "status": "success",
-            "message": "체크리스트가 성공적으로 저장되었습니다.",
-            "session_id": session_id,
-            "total_responses": total_responses
-        }
-        
-        # 새로운 구조 사용 시 추가 정보 제공
-        if disease_responses:
-            response_data.update({
-                "senior_id": senior_id,
-                "diseases_processed": list(disease_responses.keys()),
-                "disease_summary": disease_summary,
-                "processing_time": datetime.now().isoformat()
-            })
-        else:
-            # 기존 구조 호환
-            response_data.update({
-                "types_completed": len([t for t in ["nutrition", "hypertension", "depression"] if t in legacy_responses])
-            })
-        
-        return response_data
-        
+    except (DailyLimitExceeded, SessionNotActive, InvalidScoreFormat) as e:
+        raise e
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"체크리스트 제출 중 오류가 발생했습니다: {str(e)}"
         )
 
-@router.post("/care-note")
-async def submit_care_note(
-    care_note_data: dict,  # 1개 랜덤 돌봄노트 데이터
+@router.get("/checklist/status/{session_id}", response_model=ChecklistStatusResponse)
+async def get_checklist_status(
+    session_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """1개 랜덤 돌봄노트 제출 (n8n v2.0)"""
+    """체크리스트 완료 상태 조회"""
     try:
-        session_id = care_note_data.get("session_id")
-        question_id = care_note_data.get("question_id")
-        question_number = care_note_data.get("question_number")
-        content = care_note_data.get("content")
+        checklist_completed = ChecklistService.get_completion_status(db, session_id)
+        category_scores = ChecklistService.get_category_scores(db, session_id)
         
-        # 돌봄 세션 확인
-        care_session = db.query(CareSession).filter(
-            CareSession.id == session_id,
-            CareSession.caregiver_id == current_user.caregiver_profile.id
-        ).first()
-        
-        if not care_session:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="돌봄 세션을 찾을 수 없습니다."
-            )
-        
-        # 질문 정보 조회
-        question_info = db.query(CareNoteQuestion).filter(
-            CareNoteQuestion.id == question_id
-        ).first()
-        
-        if not question_info:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="질문 정보를 찾을 수 없습니다."
-            )
-        
-        # 1개 랜덤 돌봄노트 저장
-        care_note = CareNote(
-            care_session_id=session_id,
-            selected_question_id=question_id,
-            question_number=question_number,
-            question_type=question_info.question_title,  # 질문 제목을 타입으로 사용
-            question_text=question_info.question_text,   # 질문 텍스트 추가
-            content=content
+        return ChecklistStatusResponse(
+            session_id=session_id,
+            checklist_completed=checklist_completed,
+            category_scores=category_scores,
+            message="완료" if checklist_completed else "미완료"
         )
         
-        db.add(care_note)
-        db.commit()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"체크리스트 상태 조회 중 오류가 발생했습니다: {str(e)}"
+        )
+
+@router.put("/checklist/{id}")
+async def update_checklist(id: int):
+    """체크리스트 수정 차단"""
+    raise ModificationBlocked("체크리스트")
+
+@router.delete("/checklist/{id}")
+async def delete_checklist(id: int):
+    """체크리스트 삭제 차단"""
+    raise ModificationBlocked("체크리스트")
+
+@router.post("/care-note", response_model=CareNoteSuccessResponse)
+async def submit_care_note(
+    care_note_data: CareNoteRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """돌봄노트 제출 (새로운 제약 조건 적용)"""
+    try:
+        # 케어기버 프로필 확인
+        if not current_user.caregiver_profile:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="케어기버 정보를 찾을 수 없습니다."
+            )
         
-        # 체크리스트와 돌봄노트 모두 완료되면 주간 점수 계산 (임시 주석처리)
-        # await calculate_and_save_weekly_scores(session_id, care_session.senior_id, db)
+        # 활성 세션 검증
+        if not CareNoteService.validate_active_session(db, care_note_data.session_id):
+            raise SessionNotActive()
         
-        # n8n 워크플로우 트리거 (임시 주석처리)
-        # await trigger_ai_analysis_workflows_v2(session_id, care_session.senior_id)
+        # 하루 1회 제약 검증
+        if not CareNoteService.validate_daily_submission(db, care_note_data.session_id):
+            raise DailyLimitExceeded("돌봄노트")
         
-        # 세션 상태 완료로 업데이트
-        care_session.status = "completed"
-        care_session.end_time = datetime.now()
-        db.commit()
+        # 내용 길이 검증
+        if not CareNoteService.validate_content_length(care_note_data.content):
+            raise ContentLengthError()
         
-        return {
-            "message": "돌봄노트가 성공적으로 저장되었습니다.",
-            "session_id": session_id,
-            "question_id": question_id,
-            "ai_analysis_triggered": True
-        }
+        # 돌봄노트 생성
+        care_note = CareNoteService.create_care_note(
+            db,
+            care_note_data.session_id,
+            care_note_data.content,
+            care_note_data.question_id
+        )
         
+        # 선택된 질문 정보
+        selected_question = None
+        if care_note.selected_question:
+            selected_question = {
+                "id": care_note.selected_question.id,
+                "question_number": care_note.selected_question.question_number,
+                "question_title": care_note.selected_question.question_title,
+                "question_text": care_note.selected_question.question_text,
+                "guide_text": care_note.selected_question.guide_text
+            }
+        
+        return CareNoteSuccessResponse(
+            message="돌봄노트가 성공적으로 저장되었습니다",
+            session_id=care_note_data.session_id,
+            care_note_id=care_note.id,
+            selected_question=selected_question,
+            content_length=len(care_note_data.content)
+        )
+        
+    except (DailyLimitExceeded, SessionNotActive, ContentLengthError, QuestionNotFound) as e:
+        raise e
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"돌봄노트 제출 중 오류가 발생했습니다: {str(e)}"
         )
+
+@router.get("/care-note/random-question", response_model=RandomQuestionResponse)
+async def get_random_question(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """랜덤 질문 조회"""
+    try:
+        question = CareNoteService.get_random_question(db)
+        
+        if not question:
+            raise QuestionNotFound()
+        
+        return RandomQuestionResponse(
+            id=question.id,
+            question_number=question.question_number,
+            question_title=question.question_title,
+            question_text=question.question_text,
+            guide_text=question.guide_text,
+            examples=question.examples
+        )
+        
+    except QuestionNotFound as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"랜덤 질문 조회 중 오류가 발생했습니다: {str(e)}"
+        )
+
+@router.put("/care-note/{id}")
+async def update_care_note(id: int):
+    """돌봄노트 수정 차단"""
+    raise ModificationBlocked("돌봄노트")
+
+@router.delete("/care-note/{id}")
+async def delete_care_note(id: int):
+    """돌봄노트 삭제 차단"""
+    raise ModificationBlocked("돌봄노트")
 
 async def calculate_and_save_weekly_scores(session_id: int, senior_id: int, db: Session):
     """주간 체크리스트 점수 계산 및 저장"""
@@ -806,3 +867,178 @@ async def get_care_schedule(
 
 # calculate_next_care_date 함수 제거됨 (불필요)
 # POST /care-schedule API 제거됨 (관리자가 사전 설정)
+
+# ================================================================
+# 🧪 테스트용 API - 개발 환경에서만 사용
+# ================================================================
+
+@router.delete("/test/session/{session_id}")
+async def delete_test_session(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    🧪 테스트용 세션 삭제 API
+    - 개발/테스트 환경에서만 사용
+    - 세션과 관련된 모든 데이터를 삭제하여 재테스트 가능
+    """
+    try:
+        # 케어기버 권한 확인
+        if not current_user.caregiver_profile:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="케어기버 정보를 찾을 수 없습니다."
+            )
+        
+        # 해당 세션이 현재 사용자의 것인지 확인
+        session = db.query(CareSession).filter(
+            CareSession.id == session_id,
+            CareSession.caregiver_id == current_user.caregiver_profile.id
+        ).first()
+        
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="해당 세션을 찾을 수 없습니다."
+            )
+        
+        # 관련 데이터 삭제 (순서 중요: 외래키 제약조건)
+        deleted_data = {}
+        
+        # 1. 체크리스트 응답 삭제
+        checklist_count = db.query(ChecklistResponse).filter(
+            ChecklistResponse.care_session_id == session_id
+        ).count()
+        db.query(ChecklistResponse).filter(
+            ChecklistResponse.care_session_id == session_id
+        ).delete()
+        deleted_data["checklist_responses"] = checklist_count
+        
+        # 2. 돌봄노트 삭제
+        care_note_count = db.query(CareNote).filter(
+            CareNote.care_session_id == session_id
+        ).count()
+        db.query(CareNote).filter(
+            CareNote.care_session_id == session_id
+        ).delete()
+        deleted_data["care_notes"] = care_note_count
+        
+        # 3. 출석 로그 삭제
+        attendance_count = db.query(AttendanceLog).filter(
+            AttendanceLog.care_session_id == session_id
+        ).count()
+        db.query(AttendanceLog).filter(
+            AttendanceLog.care_session_id == session_id
+        ).delete()
+        deleted_data["attendance_logs"] = attendance_count
+        
+        # 4. 주간 점수 삭제
+        weekly_score_count = db.query(WeeklyChecklistScore).filter(
+            WeeklyChecklistScore.care_session_id == session_id
+        ).count()
+        db.query(WeeklyChecklistScore).filter(
+            WeeklyChecklistScore.care_session_id == session_id
+        ).delete()
+        deleted_data["weekly_scores"] = weekly_score_count
+        
+        # 5. 세션 삭제
+        db.delete(session)
+        
+        # 커밋
+        db.commit()
+        
+        return {
+            "status": "success",
+            "message": "테스트 세션이 성공적으로 삭제되었습니다.",
+            "deleted_session_id": session_id,
+            "deleted_data": deleted_data,
+            "note": "이제 새로 출근하여 체크리스트와 돌봄노트를 다시 작성할 수 있습니다."
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"세션 삭제 중 오류가 발생했습니다: {str(e)}"
+        )
+
+@router.post("/attendance/simple-checkin")
+async def simple_check_in(
+    checkin_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """🚀 간단한 출근 체크인 (senior_id만 필요)"""
+    try:
+        senior_id = checkin_data.get('senior_id')
+        if not senior_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="senior_id는 필수입니다."
+            )
+        
+        # 케어기버 프로필 확인
+        if not current_user.caregiver_profile:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="케어기버 정보를 찾을 수 없습니다."
+            )
+        
+        caregiver = current_user.caregiver_profile
+        
+        # 시니어 확인
+        senior = db.query(Senior).filter(Senior.id == senior_id).first()
+        if not senior:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="시니어를 찾을 수 없습니다."
+            )
+        
+        # 자동으로 location과 status 설정
+        location = senior.nursing_home.name if senior.nursing_home else "요양원"
+        attendance_status = "정상출근"
+        
+        # 돌봄 세션 생성
+        care_session = CareSession(
+            caregiver_id=caregiver.id,
+            senior_id=senior_id,
+            start_time=datetime.now(),
+            status='active',
+            start_location=location
+        )
+        
+        db.add(care_session)
+        db.flush()
+        
+        # 출석 로그 저장
+        attendance_log = AttendanceLog(
+            care_session_id=care_session.id,
+            type='checkin',
+            location=location,
+            attendance_status=attendance_status
+        )
+        
+        db.add(attendance_log)
+        db.commit()
+        
+        return {
+            "status": "success",
+            "message": f"{senior.name}님 돌봄 출근이 완료되었습니다.",
+            "session_id": care_session.id,
+            "senior_name": senior.name,
+            "checkin_time": care_session.start_time,
+            "location": location,
+            "attendance_status": attendance_status
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"출근 처리 중 오류가 발생했습니다: {str(e)}"
+        )

@@ -44,21 +44,13 @@ class ChecklistResponse(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     care_session_id = Column(Integer, ForeignKey("care_sessions.id"), nullable=False)
-    checklist_type_code = Column(String(20), ForeignKey("checklist_types.type_code"))  # 새 컬럼
-    sub_question_id = Column(String(10))  # A,B,C,D 등 - 새 컬럼
-    question_key = Column(String(100), nullable=False)
-    question_text = Column(Text)
-    answer = Column(JSON)  # Boolean, String, Number 등 다양한 답변 형식
-    selected_score = Column(Integer)  # 선택한 점수 (1-4점) - 새 컬럼
+    question_key = Column(String(100), nullable=False)  # nutrition_1, hypertension_1 등
+    selected_score = Column(Integer, nullable=False)  # 1-4점
     notes = Column(Text)
-    score_value = Column(Integer)  # 점수화된 값
-    category = Column(String(50))  # 카테고리 분류
-    weight = Column(DECIMAL(3,2), default=1.0)  # 가중치
     created_at = Column(DateTime, server_default=func.now())
     
     # 관계 설정
     care_session = relationship("CareSession")
-    checklist_type = relationship("ChecklistType")  # 새 관계
 
 class CareNote(Base):
     __tablename__ = "care_notes"
@@ -66,29 +58,21 @@ class CareNote(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     care_session_id = Column(Integer, ForeignKey("care_sessions.id"), nullable=False)
-    selected_question_id = Column(Integer, ForeignKey("care_note_questions.id"))  # 새 컬럼
-    question_number = Column(Integer)  # 질문 번호 (1-6) - 새 컬럼
-    question_type = Column(String(50))  # 기존 컬럼 (유지)
-    question_text = Column(Text)  # 기존 컬럼 (유지)
+    selected_question_id = Column(Integer, ForeignKey("care_note_questions.id"))
+    question_number = Column(Integer)  # 질문 번호 (1-6)
+    question_type = Column(String(50), nullable=False)
+    question_text = Column(Text)
     content = Column(Text, nullable=False)
+    is_final = Column(Boolean, default=True)  # 수정 방지용
+    modification_blocked = Column(Boolean, default=True)  # 수정 방지용
     created_at = Column(DateTime, server_default=func.now())
     
     # 관계 설정
     care_session = relationship("CareSession")
-    care_note_question = relationship("CareNoteQuestion")  # 새 관계
+    selected_question = relationship("CareNoteQuestion")
 
 
-# 새 모델들 추가
-class ChecklistType(Base):
-    __tablename__ = "checklist_types"
-    __table_args__ = {'mysql_charset': 'utf8mb4', 'mysql_collate': 'utf8mb4_unicode_ci'}
-    
-    id = Column(Integer, primary_key=True, index=True)
-    type_code = Column(String(20), unique=True, nullable=False)
-    type_name = Column(String(50), nullable=False)
-    description = Column(Text)
-    max_score = Column(Integer, default=16)
-    created_at = Column(DateTime, server_default=func.now())
+# ChecklistType은 checklist.py에서 정의됨
 
 
 class WeeklyChecklistScore(Base):
@@ -98,15 +82,15 @@ class WeeklyChecklistScore(Base):
     id = Column(Integer, primary_key=True, index=True)
     senior_id = Column(Integer, ForeignKey("seniors.id"), nullable=False)
     caregiver_id = Column(Integer, ForeignKey("caregivers.id"), nullable=False)
-    care_session_id = Column(Integer, ForeignKey("care_sessions.id"))  # 새로 추가된 컬럼
-    checklist_type_code = Column(String(20))  # 새로 추가된 컬럼
+    care_session_id = Column(Integer, ForeignKey("care_sessions.id"))
+    checklist_type_code = Column(String(20))  # nutrition, hypertension, depression
     week_start_date = Column(Date, nullable=False)
     week_end_date = Column(Date, nullable=False)
-    week_date = Column(Date)  # 새로 추가된 컬럼 (API에서 사용)
+    week_date = Column(Date)  # 돌봄 주차 날짜
     total_score = Column(Integer, nullable=False)
     max_possible_score = Column(Integer, nullable=False)
-    score_percentage = Column(DECIMAL(5,2), nullable=False)
-    status_code = Column(Integer)  # 새로 추가된 컬럼 (1:개선, 2:유지, 3:악화)
+    score_percentage = Column(Integer, nullable=False)  # 100% 환산 점수
+    status_code = Column(Integer)  # 1:개선, 2:유지, 3:악화
     checklist_count = Column(Integer, nullable=False)
     score_breakdown = Column(JSON)
     trend_indicator = Column(String(20))
