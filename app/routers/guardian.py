@@ -13,7 +13,7 @@ from ..models.report import AIReport, Feedback
 from ..models.care import WeeklyChecklistScore
 from ..schemas import (
     GuardianHomeResponse, AIReportResponse, FeedbackSubmission, 
-    SeniorResponse, NotificationResponse
+    SeniorResponse, NotificationResponse, WeeklyReportsResponse, WeeklyReportDetail
 )
 from sqlalchemy import text
 from ..services.auth import get_current_user
@@ -333,12 +333,12 @@ async def get_guardian_seniors(
 
 # ===== 🔥 구체적인 경로를 먼저 정의 (라우터 순서 중요!) =====
 
-@router.get("/reports/weekly")
+@router.get("/reports/weekly", response_model=WeeklyReportsResponse)
 async def get_weekly_ai_reports(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """🗓️ 이번 주차 AI 리포트 목록 조회"""
+    """🗓️ 이번 주차 AI 리포트 목록 조회 - 상세 점수 정보 포함"""
     try:
         # 가디언 정보 조회
         guardian = db.query(Guardian).filter(Guardian.user_id == current_user.id).first()
@@ -362,22 +362,77 @@ async def get_weekly_ai_reports(
             func.date(AIReport.created_at) <= week_end
         ).order_by(AIReport.created_at.desc()).all()
         
-        # 응답 데이터 구성
-        report_summaries = []
+        # 각 리포트에 상세 정보 추가
+        detailed_reports = []
+        
         for report in reports:
-            report_summaries.append({
+            # 현재 주 점수 데이터 조회
+            current_week_score_data = db.query(WeeklyChecklistScore).filter(
+                WeeklyChecklistScore.senior_id == senior.id,
+                WeeklyChecklistScore.checklist_type_code == report.checklist_type_code,
+                WeeklyChecklistScore.care_session_id == report.care_session_id
+            ).first()
+            
+            # 이전 주 점수 조회 (care_session_id 기준으로 이전 세션)
+            previous_week_score_data = db.query(WeeklyChecklistScore).filter(
+                WeeklyChecklistScore.senior_id == senior.id,
+                WeeklyChecklistScore.checklist_type_code == report.checklist_type_code,
+                WeeklyChecklistScore.care_session_id < report.care_session_id
+            ).order_by(WeeklyChecklistScore.care_session_id.desc()).first()
+            
+            # 최근 트렌드 데이터 조회 (최대 10개)
+            recent_trends = db.query(WeeklyChecklistScore).filter(
+                WeeklyChecklistScore.senior_id == senior.id,
+                WeeklyChecklistScore.checklist_type_code == report.checklist_type_code
+            ).order_by(WeeklyChecklistScore.week_date.desc()).limit(10).all()
+            
+            # 점수 계산
+            current_score = float(current_week_score_data.score_percentage) if current_week_score_data else 0.0
+            previous_score = float(previous_week_score_data.score_percentage) if previous_week_score_data else 0.0
+            
+            score_change = current_score - previous_score if previous_score > 0 else 0.0
+            score_change_percentage = (score_change / previous_score * 100) if previous_score > 0 else 0.0
+            
+            # 추이 데이터 변환
+            trend_items = []
+            for trend in recent_trends:
+                trend_items.append({
+                    "week_date": trend.week_date.strftime("%Y-%m-%d") if trend.week_date else "",
+                    "score_percentage": float(trend.score_percentage),
+                    "status_code": trend.status_code or 2
+                })
+            
+            # 상태 텍스트 및 메시지 생성
+            status_text = get_status_text(report.status_code or 2)
+            improvement_message = calculate_improvement_message(
+                current_score, previous_score, report.status_code or 2
+            )
+            
+            # 상세 리포트 객체 생성
+            detailed_report = {
                 "id": report.id,
                 "report_type": report.report_type,
-                "checklist_type_code": report.checklist_type_code,
+                "checklist_type_code": report.checklist_type_code or "",
                 "content": report.content,
                 "ai_comment": report.ai_comment,
                 "status_code": report.status_code,
-                "trend_analysis": report.trend_analysis,
+                "trend_analysis": report.trend_analysis or "",
                 "created_at": report.created_at.strftime("%Y-%m-%d %H:%M"),
                 "senior_name": senior.name,
                 "senior_id": senior.id,
-                "session_id": report.care_session_id
-            })
+                "session_id": report.care_session_id,
+                
+                # 새로 추가되는 필드들
+                "current_week_score": current_score,
+                "previous_week_score": previous_score,
+                "score_change": round(score_change, 2),
+                "score_change_percentage": round(score_change_percentage, 2),
+                "recent_3_weeks_trend": trend_items,
+                "status_text": status_text,
+                "improvement_message": improvement_message
+            }
+            
+            detailed_reports.append(detailed_report)
         
         has_detailed_reports = len([r for r in reports if r.report_type != 'care_note_comment']) > 0
         
@@ -386,7 +441,7 @@ async def get_weekly_ai_reports(
             "senior_name": senior.name,
             "senior_id": senior.id,
             "total_reports": len(reports),
-            "reports": report_summaries,
+            "reports": detailed_reports,
             "has_detailed_reports": has_detailed_reports
         }
         
@@ -394,6 +449,29 @@ async def get_weekly_ai_reports(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"주간 리포트 조회 중 오류: {str(e)}")
+
+def get_status_text(status_code: int) -> str:
+    """상태 코드를 텍스트로 변환"""
+    status_map = {1: "개선", 2: "유지", 3: "악화"}
+    return status_map.get(status_code, "알 수 없음")
+
+def calculate_improvement_message(current_score: float, previous_score: float, status_code: int) -> str:
+    """개선 메시지 생성"""
+    if previous_score == 0:
+        return "첫 주 데이터입니다"
+    
+    change = current_score - previous_score
+    change_percentage = abs(change / previous_score * 100) if previous_score > 0 else 0
+    
+    if status_code == 1:  # 개선
+        return f"지난주 대비 {change:.1f}점 상승하여 개선되었습니다"
+    elif status_code == 3:  # 악화
+        return f"지난주 대비 {abs(change):.1f}점 하락하여 주의가 필요합니다"
+    else:  # 유지
+        if abs(change) < 0.1:
+            return f"지난주와 동일한 수준으로 안정적으로 유지되었습니다"
+        else:
+            return f"지난주 대비 {abs(change):.1f}점 {'상승' if change > 0 else '하락'}하여 유지되었습니다"
 
 @router.get("/reports")
 async def get_reports(

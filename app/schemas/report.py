@@ -102,3 +102,39 @@ class TrendingKeywordsResponse(BaseModel):
     trending_keywords: List[TrendingKeyword]
     period_days: int
     total_reports: int
+
+# 새로 추가되는 스키마들
+class WeeklyTrendItem(BaseModel):
+    week_date: str
+    score_percentage: float
+    status_code: int
+
+class WeeklyReportDetail(BaseModel):
+    id: int
+    report_type: str
+    checklist_type_code: str
+    content: str
+    ai_comment: Optional[str] = None
+    status_code: Optional[int] = None
+    trend_analysis: str = ""
+    created_at: str
+    senior_name: str
+    senior_id: int
+    session_id: int
+    
+    # 새로 추가되는 필드들
+    current_week_score: Optional[float] = None
+    previous_week_score: Optional[float] = None
+    score_change: Optional[float] = None
+    score_change_percentage: Optional[float] = None
+    recent_3_weeks_trend: List[WeeklyTrendItem] = []
+    status_text: Optional[str] = None
+    improvement_message: Optional[str] = None
+
+class WeeklyReportsResponse(BaseModel):
+    current_week: str
+    senior_name: str
+    senior_id: int
+    total_reports: int
+    reports: List[WeeklyReportDetail]
+    has_detailed_reports: bool
