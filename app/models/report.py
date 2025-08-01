@@ -3,37 +3,34 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
 
-# AI 리포트 관련 모델 (MariaDB 최적화)
+# AI 리포트 관련 모델 (실제 DB 스키마와 일치)
 class AIReport(Base):
     __tablename__ = "ai_reports"
     __table_args__ = {'mysql_charset': 'utf8mb4', 'mysql_collate': 'utf8mb4_unicode_ci'}
     
     id = Column(Integer, primary_key=True, index=True)
     care_session_id = Column(Integer, ForeignKey("care_sessions.id"), nullable=False)
-    senior_id = Column(Integer, ForeignKey("seniors.id"))  # 새로 추가된 컬럼
-    report_type = Column(String(30))  # nutrition_report, hypertension_report, depression_report, care_note_comment - 새 컬럼
-    checklist_type_code = Column(String(20), ForeignKey("checklist_types.type_code"))  # 새 컬럼
-    keywords = Column(JSON)  # 키워드 리스트
+    senior_id = Column(Integer, ForeignKey("seniors.id"))  # 시니어 ID
+    report_type = Column(String(30))  # nutrition_report, hypertension_report, depression_report, care_note_comment
+    checklist_type_code = Column(String(20))  # 체크리스트 타입 코드
     content = Column(Text, nullable=False)  # 리포트 본문
     ai_comment = Column(Text)  # AI 코멘트
-    status_code = Column(Integer)  # 1:개선, 2:유지, 3:악화 (코멘트는 NULL) - 새 컬럼
-    trend_analysis = Column(Text)  # 3주차 추이 분석 내용 - 새 컬럼
+    status_code = Column(Integer)  # 1:개선, 2:유지, 3:악화
+    trend_analysis = Column(Text)  # 3주차 추이 분석 내용
     status = Column(String(20), default="generated")  # generated, read, reviewed
     
-    # 새로 추가된 컬럼들
-    checklist_score_total = Column(Integer)
-    checklist_score_percentage = Column(DECIMAL(5,2))
-    trend_comparison = Column(JSON)
-    special_notes_summary = Column(Text)
-    n8n_workflow_id = Column(String(100))
-    ai_processing_status = Column(String(20), default="pending")  # pending, processing, completed, failed
+    # 실제 DB에 있는 컬럼들
+    checklist_score_total = Column(Integer)  # 체크리스트 총점
+    checklist_score_percentage = Column(DECIMAL(5,2))  # 체크리스트 백분율
+    special_notes_summary = Column(Text)  # 특이사항 요약
+    n8n_workflow_id = Column(String(50))  # n8n 워크플로우 ID
+    ai_processing_status = Column(String(20), default="pending")  # AI 처리 상태
     
     created_at = Column(DateTime, server_default=func.now())
     
     # 관계 설정
     care_session = relationship("CareSession")
-    senior = relationship("Senior")  # 새로 추가된 관계
-    checklist_type = relationship("ChecklistType")  # 새 관계
+    senior = relationship("Senior")
 
 class Feedback(Base):
     __tablename__ = "feedbacks"

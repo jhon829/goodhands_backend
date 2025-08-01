@@ -3,11 +3,14 @@
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import text, func
 from typing import List, Optional
 from datetime import datetime, date, timedelta
 
 from ..database import get_db
 from ..models import User, Guardian, Senior, AIReport, CareSession, Feedback, Notification, Caregiver, ChecklistResponse, CareNote
+from ..models.report import AIReport, Feedback
+from ..models.care import WeeklyChecklistScore
 from ..schemas import (
     GuardianHomeResponse, AIReportResponse, FeedbackSubmission, 
     SeniorResponse, NotificationResponse
@@ -100,19 +103,24 @@ async def get_guardian_home(
                 elif care_notes:
                     special_note = care_notes[0].content[:50] + "..." if len(care_notes[0].content) > 50 else care_notes[0].content
                 
-                # AI 리포트 확인
-                ai_report = db.query(AIReport).filter(
-                    AIReport.care_session_id == latest_session.id
-                ).first()
-                
-                if ai_report and ai_report.keywords:
-                    try:
-                        import json
-                        keywords = json.loads(ai_report.keywords) if isinstance(ai_report.keywords, str) else ai_report.keywords
-                        if keywords and len(keywords) > 0:
-                            special_note = f"{keywords[0]} 관련 상태"
-                    except:
-                        pass
+                # AI 리포트 확인 (keywords 없으므로 content 기반으로 처리)
+                try:
+                    ai_report = db.query(AIReport).filter(
+                        AIReport.care_session_id == latest_session.id
+                    ).first()
+                    
+                    if ai_report:
+                        # content 기반으로 특이사항 추출
+                        if ai_report.content:
+                            content_preview = ai_report.content[:50] + "..." if len(ai_report.content) > 50 else ai_report.content
+                            special_note = f"AI 분석: {content_preview}"
+                        # ai_comment가 있으면 우선 사용
+                        elif ai_report.ai_comment:
+                            comment_preview = ai_report.ai_comment[:50] + "..." if len(ai_report.ai_comment) > 50 else ai_report.ai_comment
+                            special_note = f"AI 제안: {comment_preview}"
+                except Exception as e:
+                    print(f"AI 리포트 조회 중 오류: {e}")
+                    pass
             
             # 케어기버 정보 (관계를 통해 이미 로드됨)
             caregiver_name = senior.caregiver.name if senior.caregiver else "케어기버 미배정"
@@ -148,17 +156,28 @@ async def get_guardian_home(
         
         recent_reports_data = []
         for report in recent_reports:
-            session = db.query(CareSession).filter(CareSession.id == report.care_session_id).first()
-            senior = db.query(Senior).filter(Senior.id == session.senior_id).first()
-            
-            recent_reports_data.append({
-                "report_id": report.id,
-                "senior_name": senior.name,
-                "created_date": report.created_at.strftime("%Y-%m-%d"),
-                "keywords": report.keywords,
-                "status": report.status,
-                "priority": "high" if "위험" in (report.ai_comment or "") else "normal"
-            })
+            try:
+                session = db.query(CareSession).filter(CareSession.id == report.care_session_id).first()
+                senior = db.query(Senior).filter(Senior.id == session.senior_id).first()
+                
+                # keywords 컬럼이 없으므로 content에서 키워드 추출
+                keywords = None
+                if report.content:
+                    # content의 첫 몇 단어를 키워드로 사용
+                    content_words = report.content.split()[:3]  # 첫 3단어
+                    keywords = content_words if content_words else None
+                
+                recent_reports_data.append({
+                    "report_id": report.id,
+                    "senior_name": senior.name if senior else "시니어 정보 없음",
+                    "created_date": report.created_at.strftime("%Y-%m-%d"),
+                    "keywords": keywords,
+                    "status": report.status,
+                    "priority": "high" if "위험" in (report.ai_comment or "") else "normal"
+                })
+            except Exception as e:
+                print(f"리포트 처리 중 오류: {e}")
+                continue
         
         # 6. 읽지 않은 알림 조회
         unread_notifications = db.query(Notification).filter(
@@ -312,6 +331,70 @@ async def get_guardian_seniors(
             detail=f"시니어 목록 조회 중 오류가 발생했습니다: {str(e)}"
         )
 
+# ===== 🔥 구체적인 경로를 먼저 정의 (라우터 순서 중요!) =====
+
+@router.get("/reports/weekly")
+async def get_weekly_ai_reports(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """🗓️ 이번 주차 AI 리포트 목록 조회"""
+    try:
+        # 가디언 정보 조회
+        guardian = db.query(Guardian).filter(Guardian.user_id == current_user.id).first()
+        if not guardian:
+            raise HTTPException(status_code=404, detail="가디언 정보를 찾을 수 없습니다")
+        
+        # 담당 시니어 조회
+        senior = db.query(Senior).filter(Senior.guardian_id == guardian.id).first()
+        if not senior:
+            raise HTTPException(status_code=404, detail="담당 시니어를 찾을 수 없습니다")
+        
+        # 이번 주 날짜 계산
+        today = date.today()
+        week_start = today - timedelta(days=today.weekday())
+        week_end = week_start + timedelta(days=6)
+        
+        # 이번 주 AI 리포트 조회
+        reports = db.query(AIReport).filter(
+            AIReport.senior_id == senior.id,
+            func.date(AIReport.created_at) >= week_start,
+            func.date(AIReport.created_at) <= week_end
+        ).order_by(AIReport.created_at.desc()).all()
+        
+        # 응답 데이터 구성
+        report_summaries = []
+        for report in reports:
+            report_summaries.append({
+                "id": report.id,
+                "report_type": report.report_type,
+                "checklist_type_code": report.checklist_type_code,
+                "content": report.content,
+                "ai_comment": report.ai_comment,
+                "status_code": report.status_code,
+                "trend_analysis": report.trend_analysis,
+                "created_at": report.created_at.strftime("%Y-%m-%d %H:%M"),
+                "senior_name": senior.name,
+                "senior_id": senior.id,
+                "session_id": report.care_session_id
+            })
+        
+        has_detailed_reports = len([r for r in reports if r.report_type != 'care_note_comment']) > 0
+        
+        return {
+            "current_week": week_start.strftime("%Y-%m-%d"),
+            "senior_name": senior.name,
+            "senior_id": senior.id,
+            "total_reports": len(reports),
+            "reports": report_summaries,
+            "has_detailed_reports": has_detailed_reports
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"주간 리포트 조회 중 오류: {str(e)}")
+
 @router.get("/reports")
 async def get_reports(
     start_date: Optional[date] = None,
@@ -372,11 +455,22 @@ async def get_reports(
             senior = db.query(Senior).filter(Senior.id == session.senior_id).first()
             caregiver = db.query(Caregiver).filter(Caregiver.id == session.caregiver_id).first()
             
+            # keywords 컬럼이 없으므로 content에서 키워드 생성
+            keywords = None
+            if report.content:
+                # content의 첫 몇 단어를 키워드로 사용
+                content_words = report.content.split()[:3]
+                keywords = content_words if content_words else None
+            
             reports_data.append({
                 "id": report.id,
-                "keywords": report.keywords,
+                "report_type": report.report_type,
                 "content": report.content,
                 "ai_comment": report.ai_comment,
+                "status_code": report.status_code,
+                "trend_analysis": report.trend_analysis,
+                "checklist_type_code": report.checklist_type_code,
+                "keywords": keywords,
                 "status": report.status,
                 "created_at": report.created_at.strftime("%Y-%m-%d %H:%M"),
                 "senior": {
@@ -400,6 +494,426 @@ async def get_reports(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"리포트 목록 조회 중 오류가 발생했습니다: {str(e)}"
         )
+
+@router.get("/reports/today")
+async def get_today_reports(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """오늘 생성된 AI 리포트들 조회"""
+    try:
+        # 현재 사용자의 가디언 정보 조회
+        guardian = db.query(Guardian).filter(
+            Guardian.user_id == current_user.id
+        ).first()
+        
+        if not guardian:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="가디언 정보를 찾을 수 없습니다."
+            )
+        
+        # 담당 시니어 목록 조회
+        seniors = db.query(Senior).filter(
+            Senior.guardian_id == guardian.id
+        ).all()
+        
+        if not seniors:
+            return {
+                "reports": [],
+                "total_count": 0,
+                "today_date": datetime.now().strftime("%Y-%m-%d")
+            }
+        
+        senior_ids = [senior.id for senior in seniors]
+        
+        # 오늘 날짜 계산 (한국 시간 기준)
+        today = datetime.now().date()
+        tomorrow = today + timedelta(days=1)
+        
+        # 오늘 생성된 AI 리포트 조회
+        today_reports_query = text("""
+            SELECT 
+                ar.id,
+                ar.report_type,
+                ar.content,
+                ar.ai_comment,
+                ar.status_code,
+                ar.trend_analysis,
+                ar.checklist_type_code,
+                ar.status,
+                ar.created_at,
+                cs.id as session_id,
+                cs.start_time,
+                cs.end_time,
+                cs.senior_id,
+                s.name as senior_name,
+                s.age as senior_age,
+                s.photo as senior_photo,
+                cg.id as caregiver_id,
+                cg.name as caregiver_name
+            FROM ai_reports ar
+            JOIN care_sessions cs ON ar.care_session_id = cs.id
+            JOIN seniors s ON cs.senior_id = s.id
+            LEFT JOIN caregivers cg ON cs.caregiver_id = cg.id
+            WHERE cs.senior_id IN :senior_ids
+            AND DATE(ar.created_at) = :today_date
+            ORDER BY ar.created_at DESC, ar.report_type
+        """)
+        
+        reports_result = db.execute(
+            today_reports_query,
+            {
+                "senior_ids": tuple(senior_ids),
+                "today_date": today
+            }
+        ).fetchall()
+        
+        # 시니어별로 리포트 그룹화
+        reports_by_senior = {}
+        for report in reports_result:
+            senior_id = report.senior_id
+            if senior_id not in reports_by_senior:
+                reports_by_senior[senior_id] = {
+                    "senior": {
+                        "id": senior_id,
+                        "name": report.senior_name,
+                        "age": report.senior_age,
+                        "photo": report.senior_photo
+                    },
+                    "caregiver": {
+                        "id": report.caregiver_id,
+                        "name": report.caregiver_name
+                    },
+                    "session": {
+                        "id": report.session_id,
+                        "start_time": report.start_time.strftime("%Y-%m-%d %H:%M") if report.start_time else None,
+                        "end_time": report.end_time.strftime("%Y-%m-%d %H:%M") if report.end_time else None
+                    },
+                    "reports": []
+                }
+            
+            # keywords 생성
+            keywords = None
+            if report.content:
+                content_words = report.content.split()[:3]
+                keywords = content_words if content_words else None
+            
+            reports_by_senior[senior_id]["reports"].append({
+                "id": report.id,
+                "report_type": report.report_type,
+                "content": report.content,
+                "ai_comment": report.ai_comment,
+                "status_code": report.status_code,
+                "trend_analysis": report.trend_analysis,
+                "checklist_type_code": report.checklist_type_code,
+                "keywords": keywords,
+                "status": report.status,
+                "created_at": report.created_at.strftime("%Y-%m-%d %H:%M")
+            })
+        
+        # 응답 데이터 구성
+        formatted_reports = list(reports_by_senior.values())
+        
+        return {
+            "reports": formatted_reports,
+            "total_count": len(reports_result),
+            "senior_count": len(formatted_reports),
+            "today_date": today.strftime("%Y-%m-%d"),
+            "summary": {
+                "nutrition_reports": len([r for r in reports_result if r.report_type == "nutrition_report"]),
+                "hypertension_reports": len([r for r in reports_result if r.report_type == "hypertension_report"]), 
+                "depression_reports": len([r for r in reports_result if r.report_type == "depression_report"]),
+                "care_note_comments": len([r for r in reports_result if r.report_type == "care_note_comment"])
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"오늘 리포트 조회 중 오류가 발생했습니다: {str(e)}"
+        )
+
+@router.get("/checklist/{session_id}")
+async def get_checklist_scores(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """특정 세션의 체크리스트 원본 점수 조회 (가디언용)"""
+    try:
+        # 현재 사용자의 가디언 정보 조회
+        guardian = db.query(Guardian).filter(
+            Guardian.user_id == current_user.id
+        ).first()
+        
+        if not guardian:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="가디언 정보를 찾을 수 없습니다."
+            )
+        
+        # 세션 정보 조회
+        session = db.query(CareSession).filter(
+            CareSession.id == session_id
+        ).first()
+        
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="돌봄 세션을 찾을 수 없습니다."
+            )
+        
+        # 시니어 정보 조회 및 권한 확인
+        senior = db.query(Senior).filter(
+            Senior.id == session.senior_id
+        ).first()
+        
+        if not senior or senior.guardian_id != guardian.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="해당 세션에 접근할 권한이 없습니다."
+            )
+        
+        # 체크리스트 응답 조회
+        checklist_responses = db.query(ChecklistResponse).filter(
+            ChecklistResponse.care_session_id == session_id
+        ).all()
+        
+        if not checklist_responses:
+            return {
+                "session_id": session_id,
+                "senior": {
+                    "id": senior.id,
+                    "name": senior.name,
+                    "photo": senior.photo
+                },
+                "session_date": session.start_time.strftime("%Y-%m-%d") if session.start_time else None,
+                "checklist_scores": {},
+                "total_count": 0,
+                "message": "체크리스트 데이터가 없습니다."
+            }
+        
+        # 케어기버 정보 조회
+        caregiver = db.query(Caregiver).filter(
+            Caregiver.id == session.caregiver_id
+        ).first()
+        
+        # 체크리스트 점수를 카테고리별로 그룹화
+        checklist_by_category = {}
+        
+        for response in checklist_responses:
+            # question_key에서 카테고리 추출 (예: nutrition_1 -> nutrition)
+            if '_' in response.question_key:
+                category = response.question_key.split('_')[0]
+            else:
+                category = response.question_key
+            
+            if category not in checklist_by_category:
+                checklist_by_category[category] = {
+                    "category": category,
+                    "scores": [],
+                    "notes": []
+                }
+            
+            # 점수와 노트 추가
+            if response.selected_score is not None:
+                checklist_by_category[category]["scores"].append(response.selected_score)
+            
+            if response.notes:
+                checklist_by_category[category]["notes"].append(response.notes)
+        
+        # 카테고리별 통계 계산
+        checklist_summary = {}
+        for category, data in checklist_by_category.items():
+            if data["scores"]:
+                total_score = sum(data["scores"])
+                max_possible = len(data["scores"]) * 4  # 각 질문 최대 4점
+                percentage = (total_score / max_possible) * 100 if max_possible > 0 else 0
+                
+                checklist_summary[category] = {
+                    "category_name": _get_category_name(category),
+                    "raw_scores": data["scores"],
+                    "total_score": total_score,
+                    "max_possible_score": max_possible,
+                    "percentage": round(percentage, 1),
+                    "question_count": len(data["scores"]),
+                    "notes": data["notes"],
+                    "average_score": round(total_score / len(data["scores"]), 1) if data["scores"] else 0
+                }
+        
+        return {
+            "session_id": session_id,
+            "senior": {
+                "id": senior.id,
+                "name": senior.name,
+                "age": senior.age,
+                "photo": senior.photo
+            },
+            "caregiver": {
+                "id": caregiver.id if caregiver else None,
+                "name": caregiver.name if caregiver else "케어기버 정보 없음"
+            },
+            "session_date": session.start_time.strftime("%Y-%m-%d") if session.start_time else None,
+            "session_time": {
+                "start_time": session.start_time.strftime("%Y-%m-%d %H:%M") if session.start_time else None,
+                "end_time": session.end_time.strftime("%Y-%m-%d %H:%M") if session.end_time else None
+            },
+            "checklist_scores": checklist_summary,
+            "total_categories": len(checklist_summary),
+            "total_responses": len(checklist_responses)
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"체크리스트 조회 중 오류가 발생했습니다: {str(e)}"
+        )
+
+@router.get("/checklist/today/{senior_id}")
+async def get_today_checklist_scores(
+    senior_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """특정 시니어의 오늘 체크리스트 점수 조회 (가디언용)"""
+    try:
+        # 현재 사용자의 가디언 정보 조회
+        guardian = db.query(Guardian).filter(
+            Guardian.user_id == current_user.id
+        ).first()
+        
+        if not guardian:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="가디언 정보를 찾을 수 없습니다."
+            )
+        
+        # 시니어 정보 조회 및 권한 확인
+        senior = db.query(Senior).filter(
+            Senior.id == senior_id,
+            Senior.guardian_id == guardian.id
+        ).first()
+        
+        if not senior:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="시니어 정보를 찾을 수 없습니다."
+            )
+        
+        # 오늘 날짜
+        today = datetime.now().date()
+        
+        # 오늘의 돌봄 세션 조회
+        today_session = db.query(CareSession).filter(
+            CareSession.senior_id == senior_id,
+            func.date(CareSession.start_time) == today
+        ).first()
+        
+        if not today_session:
+            return {
+                "senior": {
+                    "id": senior.id,
+                    "name": senior.name,
+                    "photo": senior.photo
+                },
+                "today_date": today.strftime("%Y-%m-%d"),
+                "checklist_scores": {},
+                "total_categories": 0,
+                "message": "오늘 체크리스트 데이터가 없습니다."
+            }
+        
+        # 오늘 세션의 체크리스트 조회
+        checklist_responses = db.query(ChecklistResponse).filter(
+            ChecklistResponse.care_session_id == today_session.id
+        ).all()
+        
+        if not checklist_responses:
+            return {
+                "senior": {
+                    "id": senior.id,
+                    "name": senior.name,
+                    "photo": senior.photo
+                },
+                "today_date": today.strftime("%Y-%m-%d"),
+                "session_id": today_session.id,
+                "checklist_scores": {},
+                "total_categories": 0,
+                "message": "오늘 체크리스트 데이터가 없습니다."
+            }
+        
+        # 체크리스트 점수를 카테고리별로 그룹화
+        checklist_by_category = {}
+        
+        for response in checklist_responses:
+            # question_key에서 카테고리 추출
+            if '_' in response.question_key:
+                category = response.question_key.split('_')[0]
+            else:
+                category = response.question_key
+            
+            if category not in checklist_by_category:
+                checklist_by_category[category] = {
+                    "category": category,
+                    "scores": [],
+                    "notes": []
+                }
+            
+            if response.selected_score is not None:
+                checklist_by_category[category]["scores"].append(response.selected_score)
+            
+            if response.notes:
+                checklist_by_category[category]["notes"].append(response.notes)
+        
+        # 카테고리별 통계 계산
+        checklist_summary = {}
+        for category, data in checklist_by_category.items():
+            if data["scores"]:
+                total_score = sum(data["scores"])
+                max_possible = len(data["scores"]) * 4
+                percentage = (total_score / max_possible) * 100 if max_possible > 0 else 0
+                
+                checklist_summary[category] = {
+                    "category_name": _get_category_name(category),
+                    "raw_scores": data["scores"],
+                    "total_score": total_score,
+                    "max_possible_score": max_possible,
+                    "percentage": round(percentage, 1),
+                    "question_count": len(data["scores"]),
+                    "notes": data["notes"],
+                    "average_score": round(total_score / len(data["scores"]), 1) if data["scores"] else 0
+                }
+        
+        return {
+            "senior": {
+                "id": senior.id,
+                "name": senior.name,
+                "age": senior.age,
+                "photo": senior.photo
+            },
+            "today_date": today.strftime("%Y-%m-%d"),
+            "session_id": today_session.id,
+            "checklist_scores": checklist_summary,
+            "total_categories": len(checklist_summary),
+            "total_responses": len(checklist_responses)
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"오늘 체크리스트 조회 중 오류가 발생했습니다: {str(e)}"
+        )
+
+def _get_category_name(category_code: str) -> str:
+    """카테고리 코드를 한국어 이름으로 변환"""
+    category_names = {
+        "nutrition": "영양상태",
+        "hypertension": "고혈압",
+        "depression": "우울증/정신건강",
+        "diabetes": "당뇨",
+        "dementia": "치매/인지기능"
+    }
+    return category_names.get(category_code, category_code)
 
 @router.get("/reports/{report_id}")
 async def get_report_detail(
@@ -775,9 +1289,8 @@ async def get_guardian_home_enhanced(
         # 최근 리포트 조회 (향상된 버전 - 카테고리 정보 포함)
         recent_reports_query = text("""
             SELECT 
-                ar.id, ar.keywords, ar.content, ar.ai_comment,
+                ar.id, ar.content, ar.ai_comment,
                 ar.created_at, ar.status,
-                ar.category_details, ar.ui_components,
                 cs.senior_id,
                 s.name as senior_name
             FROM ai_reports ar
@@ -793,20 +1306,24 @@ async def get_guardian_home_enhanced(
             {"senior_ids": tuple(senior_ids)}
         ).fetchall()
         
-        recent_reports = [
-            {
+        recent_reports = []
+        for report in recent_reports_result:
+            # keywords 컬럼이 없으므로 content에서 키워드 생성
+            keywords = None
+            if hasattr(report, 'content') and report.content:
+                content_words = report.content.split()[:3]
+                keywords = content_words if content_words else None
+            
+            recent_reports.append({
                 "id": report.id,
-                "keywords": report.keywords,
+                "keywords": keywords,
                 "content": report.content,
                 "ai_comment": report.ai_comment,
                 "created_at": report.created_at,
                 "status": report.status,
-                "category_details": report.category_details,
-                "ui_components": report.ui_components,
                 "senior_id": report.senior_id,
                 "senior_name": report.senior_name
-            } for report in recent_reports_result
-        ]
+            })
         
         # 읽지 않은 알림 조회
         unread_notifications = db.query(Notification).filter(
@@ -1022,14 +1539,10 @@ async def get_reports_enhanced(
         enhanced_reports_query = text(f"""
             SELECT 
                 ar.id,
-                ar.keywords,
                 ar.content,
                 ar.ai_comment,
                 ar.status,
                 ar.created_at,
-                ar.category_details,
-                ar.ui_components,
-                ar.ui_enhancements,
                 cs.senior_id,
                 s.name as senior_name,
                 s.photo as senior_photo,
@@ -1080,20 +1593,23 @@ async def get_reports_enhanced(
                         if trend in categories_summary[category]:
                             categories_summary[category][trend] += 1
             
+            # keywords 컬럼이 없으므로 content에서 키워드 생성
+            keywords = None
+            if hasattr(report, 'content') and report.content:
+                content_words = report.content.split()[:3]
+                keywords = content_words if content_words else None
+            
             enhanced_reports.append({
                 "id": report.id,
-                "keywords": report.keywords,
+                "keywords": keywords,
                 "content": report.content,
                 "ai_comment": report.ai_comment,
                 "status": report.status,
                 "created_at": report.created_at,
-                "category_details": category_details,
-                "ui_components": ui_components,
-                "ui_enhancements": report.ui_enhancements,
                 "senior": {
                     "id": report.senior_id,
                     "name": report.senior_name,
-                    "photo": report.senior_photo
+                    "photo": getattr(report, 'senior_photo', None)
                 },
                 "caregiver_name": report.caregiver_name
             })
@@ -1127,14 +1643,14 @@ async def get_report_detailed(
         detailed_query = text("""
             SELECT 
                 ar.id,
-                ar.keywords,
+                ar.report_type,
                 ar.content,
                 ar.ai_comment,
+                ar.status_code,
+                ar.trend_analysis,
+                ar.checklist_type_code,
                 ar.status,
                 ar.created_at,
-                ar.category_details,
-                ar.ui_components,
-                ar.ui_enhancements,
                 cs.id as session_id,
                 cs.start_time,
                 cs.end_time,
@@ -1229,17 +1745,24 @@ async def get_report_detailed(
             db.execute(update_query, {"report_id": report_id})
             db.commit()
         
+        # keywords 컬럼이 없으므로 content에서 키워드 생성
+        keywords = None
+        if hasattr(report_result, 'content') and report_result.content:
+            content_words = report_result.content.split()[:3]
+            keywords = content_words if content_words else None
+        
         return {
             "report": {
                 "id": report_result.id,
-                "keywords": report_result.keywords,
+                "report_type": report_result.report_type,
                 "content": report_result.content,
                 "ai_comment": report_result.ai_comment,
+                "status_code": report_result.status_code,
+                "trend_analysis": report_result.trend_analysis,
+                "checklist_type_code": report_result.checklist_type_code,
+                "keywords": keywords,
                 "status": "read",  # 읽음 처리됨
-                "created_at": report_result.created_at,
-                "category_details": category_details,
-                "ui_components": ui_components,
-                "ui_enhancements": report_result.ui_enhancements
+                "created_at": report_result.created_at
             },
             "session": {
                 "id": report_result.session_id,
@@ -1286,6 +1809,116 @@ async def get_report_detailed(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"상세 리포트 조회 중 오류가 발생했습니다: {str(e)}"
         )
+
+@router.get("/seniors/{senior_id}/latest-report")
+async def get_senior_latest_report(
+    senior_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """📋 특정 시니어의 최신 AI 리포트 요약 조회"""
+    try:
+        # 가디언 정보 조회
+        guardian = db.query(Guardian).filter(Guardian.user_id == current_user.id).first()
+        if not guardian:
+            raise HTTPException(status_code=404, detail="가디언 정보를 찾을 수 없습니다")
+        
+        # 시니어 정보 및 권한 확인
+        senior = db.query(Senior).filter(
+            Senior.id == senior_id,
+            Senior.guardian_id == guardian.id
+        ).first()
+        
+        if not senior:
+            raise HTTPException(
+                status_code=404,
+                detail="시니어 정보를 찾을 수 없거나 접근 권한이 없습니다"
+            )
+        
+        # 최신 AI 리포트 조회 (모든 타입)
+        latest_reports = db.query(AIReport).filter(
+            AIReport.senior_id == senior_id
+        ).order_by(AIReport.created_at.desc()).limit(10).all()
+        
+        if not latest_reports:
+            return {
+                "senior": {
+                    "id": senior.id,
+                    "name": senior.name,
+                    "age": senior.age,
+                    "photo": senior.photo
+                },
+                "latest_reports": [],
+                "total_count": 0,
+                "message": "아직 AI 리포트가 없습니다"
+            }
+        
+        # 리포트 타입별로 그룹화
+        reports_by_type = {}
+        for report in latest_reports:
+            report_type = report.report_type
+            if report_type not in reports_by_type:
+                reports_by_type[report_type] = []
+            
+            # keywords 생성
+            keywords = None
+            if report.content:
+                content_words = report.content.split()[:3]
+                keywords = content_words if content_words else None
+            
+            reports_by_type[report_type].append({
+                "id": report.id,
+                "report_type": report.report_type,
+                "checklist_type_code": report.checklist_type_code,
+                "content": report.content,
+                "ai_comment": report.ai_comment,
+                "status_code": report.status_code,
+                "trend_analysis": report.trend_analysis,
+                "keywords": keywords,
+                "status": report.status,
+                "created_at": report.created_at.strftime("%Y-%m-%d %H:%M")
+            })
+        
+        # 가장 최신 리포트들 선별 (타입별 1개씩)
+        summary_reports = []
+        for report_type, type_reports in reports_by_type.items():
+            if type_reports:
+                latest_of_type = type_reports[0]  # 이미 날짜순 정렬됨
+                summary_reports.append(latest_of_type)
+        
+        # 날짜순으로 다시 정렬
+        summary_reports.sort(key=lambda x: x["created_at"], reverse=True)
+        
+        # 케어기버 정보 조회
+        caregiver = db.query(Caregiver).filter(Caregiver.id == senior.caregiver_id).first()
+        
+        return {
+            "senior": {
+                "id": senior.id,
+                "name": senior.name,
+                "age": senior.age,
+                "photo": senior.photo,
+                "caregiver_name": caregiver.name if caregiver else "케어기버 미배정"
+            },
+            "latest_reports": summary_reports,
+            "total_count": len(summary_reports),
+            "reports_by_type": {
+                "nutrition_report": len([r for r in summary_reports if r["report_type"] == "nutrition_report"]),
+                "hypertension_report": len([r for r in summary_reports if r["report_type"] == "hypertension_report"]),
+                "depression_report": len([r for r in summary_reports if r["report_type"] == "depression_report"]),
+                "care_note_comment": len([r for r in summary_reports if r["report_type"] == "care_note_comment"])
+            },
+            "last_updated": summary_reports[0]["created_at"] if summary_reports else None
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"최신 리포트 조회 중 오류: {str(e)}"
+        )
+
 
 @router.get("/notifications")
 async def get_notifications(
@@ -1400,3 +2033,192 @@ async def get_feedback_history(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"피드백 이력 조회 중 오류가 발생했습니다: {str(e)}"
         )
+
+
+
+# ===== 🆕 AI 리포트 조회 API 추가 =====
+from pydantic import BaseModel
+from typing import Dict, Any
+import calendar
+
+class AIReportSummary(BaseModel):
+    """AI 리포트 요약 정보"""
+    id: int
+    report_type: str
+    checklist_type_code: Optional[str]
+    content: str
+    ai_comment: Optional[str]
+    status_code: Optional[int]  # 1:개선, 2:유지, 3:악화
+    trend_analysis: Optional[str]
+    created_at: datetime
+    senior_name: str
+    senior_id: int
+    session_id: int
+
+class WeeklyReportsResponse(BaseModel):
+    """주간 AI 리포트 목록 응답"""
+    current_week: date
+    senior_name: str
+    senior_id: int
+    total_reports: int
+    reports: List[AIReportSummary]
+    has_detailed_reports: bool
+
+class ScoreTrend(BaseModel):
+    """점수 추이 정보"""
+    week_date: date
+    score_percentage: float
+    status_code: int
+
+class ReportDetailResponse(BaseModel):
+    """AI 리포트 상세 응답"""
+    id: int
+    report_type: str
+    checklist_type_code: str
+    content: str
+    ai_comment: Optional[str]
+    status_code: int
+    trend_analysis: Optional[str]
+    created_at: datetime
+    senior_name: str
+    senior_id: int
+    session_id: int
+    current_week_score: float
+    previous_week_score: Optional[float]
+    score_change: Optional[float]
+    score_change_percentage: Optional[float]
+    recent_3_weeks_trend: List[ScoreTrend]
+    status_text: str
+    improvement_message: str
+
+
+
+
+
+@router.get("/reports/{report_id}/detail")
+async def get_ai_report_detail(
+    report_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """📊 AI 리포트 상세 정보 조회 (모든 타입 지원)"""
+    try:
+        # 가디언 정보 조회
+        guardian = db.query(Guardian).filter(Guardian.user_id == current_user.id).first()
+        if not guardian:
+            raise HTTPException(status_code=404, detail="가디언 정보를 찾을 수 없습니다")
+        
+        # AI 리포트 조회
+        report = db.query(AIReport).filter(AIReport.id == report_id).first()
+        if not report:
+            raise HTTPException(status_code=404, detail="AI 리포트를 찾을 수 없습니다")
+        
+        # 시니어 정보 및 권한 확인
+        senior = db.query(Senior).filter(Senior.id == report.senior_id).first()
+        if not senior or senior.guardian_id != guardian.id:
+            raise HTTPException(status_code=403, detail="접근 권한이 없습니다")
+        
+        # 모든 리포트 타입 지원 (care_note_comment 포함)
+        
+        # care_note_comment의 경우 간단한 응답
+        if report.report_type == 'care_note_comment':
+            return {
+                "id": report.id,
+                "report_type": report.report_type,
+                "content": report.content,
+                "ai_comment": report.ai_comment,
+                "created_at": report.created_at,
+                "senior_name": senior.name,
+                "senior_id": senior.id,
+                "session_id": report.care_session_id,
+                "is_care_note": True,
+                "message": "돌봄노트 코멘트"
+            }
+        
+        if not report.checklist_type_code:
+            raise HTTPException(status_code=400, detail="체크리스트 타입이 없는 리포트입니다")
+        
+        # 현재 주차 점수 조회
+        current_week_score_record = db.query(WeeklyChecklistScore).filter(
+            WeeklyChecklistScore.senior_id == senior.id,
+            WeeklyChecklistScore.checklist_type_code == report.checklist_type_code,
+            WeeklyChecklistScore.care_session_id == report.care_session_id
+        ).first()
+        
+        current_week_score = float(current_week_score_record.score_percentage) if current_week_score_record else 0.0
+        
+        # 지난 주 점수 조회
+        previous_week_score_record = db.query(WeeklyChecklistScore).filter(
+            WeeklyChecklistScore.senior_id == senior.id,
+            WeeklyChecklistScore.checklist_type_code == report.checklist_type_code,
+            WeeklyChecklistScore.week_date < (current_week_score_record.week_date if current_week_score_record else date.today())
+        ).order_by(WeeklyChecklistScore.week_date.desc()).first()
+        
+        previous_week_score = float(previous_week_score_record.score_percentage) if previous_week_score_record else None
+        
+        # 점수 변화 계산
+        score_change = None
+        score_change_percentage = None
+        if previous_week_score is not None:
+            score_change = current_week_score - previous_week_score
+            if previous_week_score > 0:
+                score_change_percentage = (score_change / previous_week_score) * 100
+        
+        # 지난 3주 추이 데이터 조회
+        three_weeks_ago = date.today() - timedelta(weeks=3)
+        recent_trends = db.query(WeeklyChecklistScore).filter(
+            WeeklyChecklistScore.senior_id == senior.id,
+            WeeklyChecklistScore.checklist_type_code == report.checklist_type_code,
+            WeeklyChecklistScore.week_date >= three_weeks_ago
+        ).order_by(WeeklyChecklistScore.week_date.asc()).all()
+        
+        # 추이 데이터 구성
+        recent_3_weeks_trend = []
+        for trend in recent_trends:
+            recent_3_weeks_trend.append(ScoreTrend(
+                week_date=trend.week_date,
+                score_percentage=float(trend.score_percentage),
+                status_code=trend.status_code or 2
+            ))
+        
+        # 상태 텍스트 변환
+        status_texts = {1: "개선", 2: "유지", 3: "악화"}
+        status_text = status_texts.get(report.status_code, "알 수 없음")
+        
+        # 개선/악화 메시지 생성
+        improvement_message = ""
+        if score_change is not None:
+            if score_change > 0:
+                improvement_message = f"지난주 대비 {score_change:.1f}점 상승하여 {status_text}되었습니다"
+            elif score_change < 0:
+                improvement_message = f"지난주 대비 {abs(score_change):.1f}점 하락하여 {status_text}되었습니다"
+            else:
+                improvement_message = f"지난주와 동일한 점수로 {status_text} 상태입니다"
+        else:
+            improvement_message = f"이번 주 첫 기록으로 {status_text} 상태입니다"
+        
+        return ReportDetailResponse(
+            id=report.id,
+            report_type=report.report_type,
+            checklist_type_code=report.checklist_type_code,
+            content=report.content,
+            ai_comment=report.ai_comment,
+            status_code=report.status_code or 2,
+            trend_analysis=report.trend_analysis,
+            created_at=report.created_at,
+            senior_name=senior.name,
+            senior_id=senior.id,
+            session_id=report.care_session_id,
+            current_week_score=current_week_score,
+            previous_week_score=previous_week_score,
+            score_change=score_change,
+            score_change_percentage=score_change_percentage,
+            recent_3_weeks_trend=recent_3_weeks_trend,
+            status_text=status_text,
+            improvement_message=improvement_message
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"리포트 상세 조회 중 오류: {str(e)}")

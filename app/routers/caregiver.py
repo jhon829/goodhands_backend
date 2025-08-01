@@ -11,6 +11,7 @@ from ..database import get_db
 from ..models import User, Senior, CareSession, ChecklistResponse, CareNote, Notification, NursingHome, ChecklistType
 from ..models.care import WeeklyChecklistScore, CareNoteQuestion, AttendanceLog
 from ..models.enhanced_care import CareSchedule
+from ..models.report import AIReport, Feedback
 from ..schemas import (
     CareSessionResponse, SeniorResponse, ChecklistSubmission, CareNoteSubmission,
     CaregiverHomeResponse, AttendanceCheckIn, AttendanceCheckOut
@@ -390,11 +391,11 @@ async def check_out_attendance(
                 detail="케어기버 정보를 찾을 수 없습니다."
             )
         
-        # 활성 세션 조회
+        # 활성 세션 조회 (가장 최근 세션)
         session = db.query(CareSession).filter(
             CareSession.caregiver_id == current_user.caregiver_profile.id,
             CareSession.status == 'active'
-        ).first()
+        ).order_by(CareSession.start_time.desc()).first()  # 🔥 가장 최근 세션
         
         if not session:
             raise SessionNotFound()
@@ -873,97 +874,212 @@ async def get_care_schedule(
 # ================================================================
 
 @router.delete("/test/session/{session_id}")
-async def delete_test_session(
+async def delete_test_session_complete(
     session_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
-    🧪 테스트용 세션 삭제 API
-    - 개발/테스트 환경에서만 사용
-    - 세션과 관련된 모든 데이터를 삭제하여 재테스트 가능
+    🚨 테스트/개발용 API: AI 리포트 포함 세션 완전 삭제
+    
+    - AI 리포트 생성 후에도 세션과 모든 관련 데이터 삭제 가능
+    - SQL 기반 안전한 삭제 처리
+    
+    ⚠️ 주의: 프로덕션 환경에서는 사용 금지!
     """
+    
     try:
         # 케어기버 권한 확인
-        if not current_user.caregiver_profile:
+        if current_user.user_type != "caregiver":
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="케어기버 정보를 찾을 수 없습니다."
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="케어기버만 접근 가능합니다"
             )
         
-        # 해당 세션이 현재 사용자의 것인지 확인
+        # 세션 존재 여부 확인
         session = db.query(CareSession).filter(
-            CareSession.id == session_id,
-            CareSession.caregiver_id == current_user.caregiver_profile.id
+            CareSession.id == session_id
         ).first()
         
         if not session:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="해당 세션을 찾을 수 없습니다."
+                detail=f"세션 ID {session_id}를 찾을 수 없습니다"
             )
         
-        # 관련 데이터 삭제 (순서 중요: 외래키 제약조건)
-        deleted_data = {}
+        # 케어기버 소유권 확인
+        caregiver = current_user.caregiver_profile
+        if not caregiver or session.caregiver_id != caregiver.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="본인이 담당한 세션만 삭제할 수 있습니다"
+            )
         
-        # 1. 체크리스트 응답 삭제
-        checklist_count = db.query(ChecklistResponse).filter(
-            ChecklistResponse.care_session_id == session_id
-        ).count()
-        db.query(ChecklistResponse).filter(
-            ChecklistResponse.care_session_id == session_id
-        ).delete()
-        deleted_data["checklist_responses"] = checklist_count
+        # SQL로 직접 삭제 처리 (외래키 순서)
+        from sqlalchemy import text
         
-        # 2. 돌봄노트 삭제
-        care_note_count = db.query(CareNote).filter(
-            CareNote.care_session_id == session_id
-        ).count()
-        db.query(CareNote).filter(
-            CareNote.care_session_id == session_id
-        ).delete()
-        deleted_data["care_notes"] = care_note_count
+        deleted_counts = {}
         
-        # 3. 출석 로그 삭제
-        attendance_count = db.query(AttendanceLog).filter(
-            AttendanceLog.care_session_id == session_id
-        ).count()
-        db.query(AttendanceLog).filter(
-            AttendanceLog.care_session_id == session_id
-        ).delete()
-        deleted_data["attendance_logs"] = attendance_count
-        
-        # 4. 주간 점수 삭제
-        weekly_score_count = db.query(WeeklyChecklistScore).filter(
-            WeeklyChecklistScore.care_session_id == session_id
-        ).count()
-        db.query(WeeklyChecklistScore).filter(
-            WeeklyChecklistScore.care_session_id == session_id
-        ).delete()
-        deleted_data["weekly_scores"] = weekly_score_count
-        
-        # 5. 세션 삭제
-        db.delete(session)
-        
-        # 커밋
-        db.commit()
-        
-        return {
-            "status": "success",
-            "message": "테스트 세션이 성공적으로 삭제되었습니다.",
-            "deleted_session_id": session_id,
-            "deleted_data": deleted_data,
-            "note": "이제 새로 출근하여 체크리스트와 돌봄노트를 다시 작성할 수 있습니다."
-        }
-        
+        try:
+            # 1단계: feedbacks 삭제
+            result = db.execute(text("""
+                DELETE FROM feedbacks 
+                WHERE ai_report_id IN (
+                    SELECT id FROM ai_reports WHERE care_session_id = :session_id
+                )
+            """), {"session_id": session_id})
+            deleted_counts["feedbacks"] = result.rowcount
+            
+            # 2단계: ai_reports 삭제
+            result = db.execute(text("""
+                DELETE FROM ai_reports WHERE care_session_id = :session_id
+            """), {"session_id": session_id})
+            deleted_counts["ai_reports"] = result.rowcount
+            
+            # 3단계: weekly_checklist_scores 삭제
+            result = db.execute(text("""
+                DELETE FROM weekly_checklist_scores WHERE care_session_id = :session_id
+            """), {"session_id": session_id})
+            deleted_counts["weekly_scores"] = result.rowcount
+            
+            # 4단계: care_notes 삭제
+            result = db.execute(text("""
+                DELETE FROM care_notes WHERE care_session_id = :session_id
+            """), {"session_id": session_id})
+            deleted_counts["care_notes"] = result.rowcount
+            
+            # 5단계: checklist_responses 삭제
+            result = db.execute(text("""
+                DELETE FROM checklist_responses WHERE care_session_id = :session_id
+            """), {"session_id": session_id})
+            deleted_counts["checklist_responses"] = result.rowcount
+            
+            # 6단계: attendance_logs 삭제
+            result = db.execute(text("""
+                DELETE FROM attendance_logs WHERE care_session_id = :session_id
+            """), {"session_id": session_id})
+            deleted_counts["attendance_logs"] = result.rowcount
+            
+            # 7단계: notifications 삭제
+            result = db.execute(text("""
+                DELETE FROM notifications 
+                WHERE data LIKE :pattern
+            """), {"pattern": f'%"session_id": {session_id}%'})
+            deleted_counts["notifications"] = result.rowcount
+            
+            # 8단계: care_sessions 삭제 (최종)
+            result = db.execute(text("""
+                DELETE FROM care_sessions WHERE id = :session_id
+            """), {"session_id": session_id})
+            deleted_counts["care_session"] = result.rowcount
+            
+            # 커밋
+            db.commit()
+            
+            total_deleted = sum(deleted_counts.values())
+            
+            return {
+                "success": True,
+                "message": f"세션 {session_id}와 모든 관련 데이터가 완전히 삭제되었습니다",
+                "session_id": session_id,
+                "total_deleted_records": total_deleted,
+                "deletion_summary": deleted_counts,
+                "warning": "⚠️ 이 작업은 되돌릴 수 없습니다. 테스트 목적으로만 사용하세요."
+            }
+            
+        except Exception as e:
+            db.rollback()
+            print(f"세션 {session_id} 삭제 중 오류 발생: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"삭제 중 오류가 발생했습니다: {str(e)}"
+            )
+            
     except HTTPException:
         raise
     except Exception as e:
-        db.rollback()
+        print(f"예상치 못한 오류: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"세션 삭제 중 오류가 발생했습니다: {str(e)}"
+            detail=f"서버 내부 오류가 발생했습니다: {str(e)}"
         )
+
+
+@router.get("/test/session/{session_id}/dependencies")
+async def check_session_dependencies(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    🔍 세션 삭제 전 의존성 확인 API
+    
+    - 삭제 대상 데이터 개수 미리 확인
+    - 삭제 가능 여부 사전 검증
+    """
+    
+    if current_user.user_type != "caregiver":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="케어기버만 접근 가능합니다"
+        )
+    
+    # 세션 존재 확인
+    session = db.query(CareSession).filter(CareSession.id == session_id).first()
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"세션 ID {session_id}를 찾을 수 없습니다"
+        )
+    
+    # 의존성 데이터 개수 확인
+    dependencies = {}
+    
+    # AI 리포트 및 피드백
+    ai_reports = db.query(AIReport).filter(AIReport.care_session_id == session_id)
+    ai_report_ids = [report.id for report in ai_reports.all()]
+    dependencies['ai_reports'] = ai_reports.count()
+    
+    if ai_report_ids:
+        dependencies['feedbacks'] = db.query(Feedback).filter(
+            Feedback.ai_report_id.in_(ai_report_ids)
+        ).count()
+    else:
+        dependencies['feedbacks'] = 0
+    
+    # 돌봄 관련 데이터
+    dependencies['weekly_scores'] = db.query(WeeklyChecklistScore).filter(
+        WeeklyChecklistScore.care_session_id == session_id
+    ).count()
+    
+    dependencies['care_notes'] = db.query(CareNote).filter(
+        CareNote.care_session_id == session_id
+    ).count()
+    
+    dependencies['checklist_responses'] = db.query(ChecklistResponse).filter(
+        ChecklistResponse.care_session_id == session_id
+    ).count()
+    
+    dependencies['attendance_logs'] = db.query(AttendanceLog).filter(
+        AttendanceLog.care_session_id == session_id
+    ).count()
+    
+    # 관련 알림
+    dependencies['notifications'] = db.query(Notification).filter(
+        Notification.data.like(f'%"session_id": {session_id}%')
+    ).count()
+    
+    total_dependencies = sum(dependencies.values())
+    
+    return {
+        "session_id": session_id,
+        "session_status": session.status,
+        "can_delete": True,  # 이제 항상 삭제 가능
+        "total_dependent_records": total_dependencies,
+        "dependencies": dependencies,
+        "message": "AI 리포트 포함 모든 관련 데이터를 안전하게 삭제할 수 있습니다" if total_dependencies > 0 else "삭제할 관련 데이터가 없습니다"
+    }
+
 
 @router.post("/attendance/simple-checkin")
 async def simple_check_in(

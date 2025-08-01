@@ -4,6 +4,7 @@ n8n 웹훅 호출 서비스
 """
 
 import requests
+import urllib3
 import logging
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -14,6 +15,9 @@ from app.models.user import Caregiver
 from app.models.senior import Senior
 from app.models.care import CareSession
 
+# SSL 경고 비활성화
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 # 로거 설정
 logger = logging.getLogger(__name__)
 
@@ -21,7 +25,7 @@ class N8NWebhookService:
     """n8n 웹훅 호출 서비스"""
     
     def __init__(self):
-        self.webhook_url = "https://pay.gzonesoft.co.kr:10006/webhook-test/complete-ai-analysis"
+        self.webhook_url = "https://pay.gzonesoft.co.kr:10006/webhook/complete-ai-analysis"
         self.timeout = 30
         self.enabled = True
         
@@ -135,6 +139,7 @@ class N8NWebhookService:
                 url=self.webhook_url,
                 json=data,
                 timeout=self.timeout,
+                verify=False,
                 headers={
                     "Content-Type": "application/json",
                     "User-Agent": "GoodHands-Backend/1.0"
@@ -190,6 +195,7 @@ class N8NWebhookService:
                 url=self.webhook_url,
                 json=test_data,
                 timeout=10,
+                verify=False,
                 headers={"Content-Type": "application/json"}
             )
             
